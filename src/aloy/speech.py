@@ -183,7 +183,7 @@ class QwenSynthesizer:
 
 
 class GeminiSynthesizer:
-    def __init__(self, api_key: str | None = None, voice: str = "Charon") -> None:
+    def __init__(self, api_key: str | None = None, voice: str = "Achird") -> None:
 
         api_key = api_key or os.environ.get("GEMINI_API_KEY")
         if not api_key:

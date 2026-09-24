@@ -70,3 +70,18 @@ cloud.transform = CATransform3DIdentity
 orb.isRecording = true
 assert(root.animation(forKey: "orbit") == nil && cloud.contents != nil)
 print("Orb fixed-root and circular-layer checks passed")
+
+var replyAudio = ReplyAudioState()
+replyAudio.begin()
+assert(!replyAudio.isSpeaking(hasPlayback: false)) // Waiting for first audio stays blue.
+replyAudio.audioArrived()
+assert(replyAudio.isSpeaking(hasPlayback: true))
+assert(replyAudio.isSpeaking(hasPlayback: false)) // The next sentence is still generating.
+replyAudio.finishGeneration()
+assert(replyAudio.isSpeaking(hasPlayback: true)) // Playback may outlast generation.
+assert(!replyAudio.isSpeaking(hasPlayback: false))
+replyAudio.begin()
+replyAudio.audioArrived()
+replyAudio.reset() // Either shortcut cancels the reply.
+assert(!replyAudio.isSpeaking(hasPlayback: false))
+print("Reply colour continuity checks passed")

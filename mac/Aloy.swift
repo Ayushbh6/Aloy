@@ -36,6 +36,12 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
     private var replyBuffer = ""
     private var lastAudioPath: String?
     private var currentRunID: String?
+    private var replyAudio = ReplyAudioState()
+
+    private func updateReplyAppearance() {
+        orb.isSpeaking = replyAudio.isSpeaking(
+            hasPlayback: player?.isPlaying == true || !audioQueue.isEmpty)
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -197,7 +203,8 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
         providerPicker.action = #selector(settingsChanged)
         canvas.addSubview(providerPicker)
         speechPicker = NSPopUpButton(frame: NSRect(x: 148, y: 24, width: 105, height: 28))
-        speechPicker.addItems(withTitles: ["Qwen Ryan", "Qwen Aiden", "Gemini voice", "Text only"])
+        speechPicker.addItems(withTitles: ["Qwen Ryan", "Qwen Aiden", "Achird · API", "Text only"])
+        speechPicker.toolTip = "Achird uses paid Gemini speech; local voices do not. Aloy's $30 monthly cap still applies."
         speechPicker.target = self
         speechPicker.action = #selector(settingsChanged)
         canvas.addSubview(speechPicker)
@@ -346,6 +353,7 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
                 append("\(role)\(marker): \(body)\n\n")
             }
         case "started":
+            replyAudio.begin()
             orb.isProcessing = true
             orb.hasError = false
             replayAssets.removeAll()
@@ -369,15 +377,19 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
             status.stringValue = "Thinking…"
         case "audio":
             if let path = object["path"] as? String, let id = object["asset_id"] as? String {
+                replyAudio.audioArrived()
                 lastAudioPath = path
                 lastAudioAssetID = id
                 replayAssets.append((path, id))
                 audioQueue.append((path, id))
                 playNext()
+                updateReplyAppearance()
             }
         case "turn_done":
+            replyAudio.finishGeneration()
             orb.isProcessing = false
-            if player?.isPlaying != true && object["failed"] as? Bool != true {
+            updateReplyAppearance()
+            if !orb.isSpeaking && object["failed"] as? Bool != true {
                 status.stringValue = "Ready"
             }
             command("list")
@@ -397,6 +409,7 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
         case "deleted":
             command("list")
         case "no_speech":
+            replyAudio.reset()
             orb.isProcessing = false
             status.stringValue = "No speech detected — nothing sent"
             orb.toolTip = status.stringValue
@@ -406,7 +419,9 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
             stopPlayback()
             status.stringValue = object["error"] as? String ?? "Error"
         case "stopped":
+            replyAudio.reset()
             orb.isProcessing = false
+            updateReplyAppearance()
             if recorder == nil { status.stringValue = "Ready" }
         default: break
         }
@@ -426,7 +441,7 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
                 return
             }
             command("playback", ["asset_id": asset.id, "status": "playing"])
-            orb.isSpeaking = true
+            updateReplyAppearance()
             status.stringValue = "Speaking…"
         } catch {
             command("playback", ["asset_id": asset.id, "status": "failed"])
@@ -437,10 +452,13 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
         if let id = playingAssetID { command("playback", ["asset_id": id, "status": flag ? "played" : "failed"]) }
         playingAssetID = nil
         self.player = nil
-        orb.isSpeaking = false
-        if !flag { status.stringValue = "Audio playback stopped unexpectedly" }
-        else if audioQueue.isEmpty { status.stringValue = "Ready" }
-        else { playNext() }
+        if !flag {
+            replyAudio.reset()
+            status.stringValue = "Audio playback stopped unexpectedly"
+        }
+        else if !audioQueue.isEmpty { playNext() }
+        else { status.stringValue = replyAudio.generationComplete ? "Ready" : "Speaking…" }
+        updateReplyAppearance()
     }
 
     private func stopPlayback() {
@@ -450,7 +468,8 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
         player = nil
         let cancelled = audioQueue
         audioQueue.removeAll()
-        orb.isSpeaking = false
+        replyAudio.reset()
+        updateReplyAppearance()
         orb.isProcessing = false
         let elapsed = (ProcessInfo.processInfo.systemUptime - began) * 1000
         if let id = playingAssetID { command("playback", ["asset_id": id, "status": "cancelled"]) }
@@ -612,6 +631,9 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
     @objc private func replayAudio() {
         guard !replayAssets.isEmpty else { status.stringValue = "No audio to replay"; return }
         stopPlayback()
+        replyAudio.begin()
+        replyAudio.audioArrived()
+        replyAudio.finishGeneration()
         audioQueue = replayAssets
         playNext()
     }

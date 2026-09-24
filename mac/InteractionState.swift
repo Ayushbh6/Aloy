@@ -44,3 +44,23 @@ struct ShortcutGesture {
         return fire
     }
 }
+
+// A reply remains in its speaking state while the next audio chunk is generated.
+struct ReplyAudioState {
+    private(set) var generationComplete = true
+    private(set) var receivedAudio = false
+
+    mutating func begin() {
+        generationComplete = false
+        receivedAudio = false
+    }
+    mutating func audioArrived() { receivedAudio = true }
+    mutating func finishGeneration() { generationComplete = true }
+    mutating func reset() {
+        generationComplete = true
+        receivedAudio = false
+    }
+    func isSpeaking(hasPlayback: Bool) -> Bool {
+        receivedAudio && (!generationComplete || hasPlayback)
+    }
+}

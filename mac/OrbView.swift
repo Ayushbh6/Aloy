@@ -4,10 +4,12 @@ import QuartzCore
 // Cached procedural particle cloud; only its centred child layer rotates.
 final class OrbView: NSView {
     var onClick: (() -> Void)?
-    var isRecording = false { didSet { updateAppearance() } }
-    var isSpeaking = false { didSet { updateAppearance() } }
-    var isProcessing = false { didSet { updateAppearance() } }
-    var hasError = false { didSet { updateAppearance() } }
+    var isRecording = false { didSet { if oldValue != isRecording { updateAppearance() } } }
+    var isSpeaking = false { didSet { if oldValue != isSpeaking { updateAppearance() } } }
+    var isProcessing = false {
+        didSet { if oldValue != isProcessing && !isSpeaking { updateAppearance() } }
+    }
+    var hasError = false { didSet { if oldValue != hasError { updateAppearance() } } }
     private var gesture = OrbGesture()
     private let cloudLayer = CALayer()
     override var isOpaque: Bool { false }
@@ -52,7 +54,7 @@ final class OrbView: NSView {
         let orbit = CABasicAnimation(keyPath: "transform.rotation.z")
         orbit.fromValue = 0
         orbit.toValue = Double.pi * 2
-        orbit.duration = isProcessing ? 6 : (isSpeaking ? 14 : (isRecording ? 24 : 120))
+        orbit.duration = isRecording ? 24 : (isSpeaking ? 14 : (isProcessing ? 6 : 120))
         orbit.repeatCount = .infinity
         cloudLayer.add(orbit, forKey: "orbit")
     }
@@ -61,19 +63,43 @@ final class OrbView: NSView {
         let shell = bounds.insetBy(dx: 3.5, dy: 3.5)
         let body = NSBezierPath(ovalIn: shell)
         let context = NSGraphicsContext.current!.cgContext
-        let accent: NSColor? = isRecording ? .systemRed : (hasError ? .systemOrange :
-            (isSpeaking ? .systemMint : (isProcessing ? .systemPurple : nil)))
+        let palette: (core: NSColor, edge: NSColor, rim: NSColor, near: NSColor, far: NSColor)
+        if isRecording {
+            palette = (
+                NSColor(calibratedRed: 0.26, green: 0.04, blue: 0.09, alpha: 0.94),
+                NSColor(calibratedRed: 0.66, green: 0.20, blue: 0.26, alpha: 0.73),
+                NSColor(calibratedRed: 1, green: 0.54, blue: 0.57, alpha: 0.86),
+                .systemRed, NSColor(calibratedRed: 1, green: 0.65, blue: 0.66, alpha: 1))
+        } else if isSpeaking {
+            palette = (
+                NSColor(calibratedRed: 0.04, green: 0.25, blue: 0.12, alpha: 0.96),
+                NSColor(calibratedRed: 0.16, green: 0.53, blue: 0.25, alpha: 0.78),
+                NSColor(calibratedRed: 0.58, green: 1, blue: 0.58, alpha: 0.92),
+                NSColor(calibratedRed: 0.47, green: 1, blue: 0.52, alpha: 1),
+                NSColor(calibratedRed: 0.77, green: 1, blue: 0.76, alpha: 1))
+        } else if hasError {
+            palette = (
+                NSColor(calibratedRed: 0.30, green: 0.13, blue: 0.04, alpha: 0.94),
+                NSColor(calibratedRed: 0.65, green: 0.36, blue: 0.13, alpha: 0.73),
+                NSColor(calibratedRed: 1, green: 0.75, blue: 0.38, alpha: 0.86),
+                .systemOrange, NSColor(calibratedRed: 1, green: 0.85, blue: 0.55, alpha: 1))
+        } else {
+            palette = (
+                NSColor(calibratedRed: 0.08, green: 0.16, blue: 0.36, alpha: 0.94),
+                NSColor(calibratedRed: 0.30, green: 0.54, blue: 0.78, alpha: 0.73),
+                NSColor(calibratedRed: 0.66, green: 0.86, blue: 1, alpha: 0.82),
+                NSColor(calibratedRed: 0.74, green: 0.63, blue: 1, alpha: 1),
+                NSColor(calibratedRed: 0.42, green: 0.83, blue: 1, alpha: 1))
+        }
         // The original cosmic cloud, inside a more visible sky-blue glass sphere.
-        NSGradient(starting: NSColor(calibratedRed: 0.08, green: 0.16, blue: 0.36, alpha: 0.94),
-                   ending: NSColor(calibratedRed: 0.30, green: 0.54, blue: 0.78, alpha: 0.73))?
+        NSGradient(starting: palette.core, ending: palette.edge)?
             .draw(in: body, relativeCenterPosition: .zero)
         context.saveGState()
         context.addEllipse(in: shell.insetBy(dx: 1, dy: 1))
         context.clip()
         context.setBlendMode(.plusLighter)
         let paths = (0..<8).map { _ in CGMutablePath() }
-        let colors = [accent ?? NSColor(calibratedRed: 0.74, green: 0.63, blue: 1, alpha: 1),
-                      accent ?? NSColor(calibratedRed: 0.42, green: 0.83, blue: 1, alpha: 1)]
+        let colors = [palette.near, palette.far]
         for i in 0..<1500 {
             let n = Double(i)
             let angle = n * 2.399963
@@ -97,7 +123,7 @@ final class OrbView: NSView {
         }
         context.restoreGState()
         body.lineWidth = 1.3
-        NSColor(calibratedRed: 0.66, green: 0.86, blue: 1, alpha: 0.82).setStroke()
+        palette.rim.setStroke()
         body.stroke()
         let innerEdge = NSBezierPath(ovalIn: shell.insetBy(dx: 1.3, dy: 1.3))
         innerEdge.lineWidth = 0.65

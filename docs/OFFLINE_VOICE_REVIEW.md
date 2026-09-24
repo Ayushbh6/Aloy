@@ -76,6 +76,42 @@ regression checks exercise real layer transforms at five-degree intervals throug
 The owner has been asked to physically test the new Option + Z / X combinations;
 confirmation is pending.
 
+## September 25 voice follow-up
+
+The owner found both local Qwen voices too stiff for sustained conversation. A
+bounded comparison generated German with the MLX Chatterbox Multilingual V3 model,
+conditioned on one existing synthetic male voice sample. Its model and required
+S3TokenizerV2 occupy about 3.2 GB together. A 3.48-second warm sample took 3.52
+seconds to synthesize; the first generation took 5.24 seconds after a 2.09-second
+model load. Qwen ASR recovered the intended words from the sample. That checks basic
+intelligibility, not naturalness or suitability for long German lessons. Because it
+ran only about as fast as its audio and carried a 3.2 GB footprint, the temporary
+comparison weights were removed. The short private audition remains available.
+
+The existing Gemini Interactions TTS adapter generated two comparable 10-second
+samples using `gemini-3.8-flash-lite-tts`. Full synthesis took 7.18 and 7.97 seconds.
+The owner liked both and preferred the warm male Achird voice, which is now the voice
+used by the explicit Gemini speech option. The app's selected speech engine did not
+silently switch from offline to paid. Google documents `stream=True` for incremental
+raw PCM audio; the current Aloy adapter still waits for a complete WAV per sentence,
+so its measured synthesis time is not a first-audio latency claim. Streaming playback
+would need a compatible native audio queue and cancellation/accounting tests.
+
+At Google's standard paid rate through December 2026, Gemini Flash-Lite TTS output
+costs $0.54 per hour of generated speech, plus a small text-input charge. The output
+rate doubles in January 2027. OpenRouter lists the same Gemini output rate. A two-hour
+daily speaking workload therefore costs about $32.40 for 30 days at the current rate,
+before text-model usage. Aloy's existing $30 monthly cap must remain enforced; the
+paid voice cannot cover that workload continuously under the cap. Neither an idle orb
+nor local STT adds TTS charges. [Gemini pricing](https://ai.google.dev/gemini-api/docs/pricing),
+[Gemini streaming TTS](https://ai.google.dev/gemini-api/docs/speech-generation),
+[OpenRouter listing](https://openrouter.ai/google/gemini-3.8-flash-lite-tts/).
+
+The native orb now keeps one green speaking appearance across gaps between audio
+chunks, turns red only for recording and stays blue while awaiting the first audio.
+Option + Z and Option + X remain the same one-hand shortcuts. Native state tests,
+38 offline Python checks and lint pass. The rebuilt app and Python backend launched.
+
 ## Storage and reproducibility
 
 Selected models occupy about 5.2 GiB; the native bundle is about 372 KiB. Old 0.6B ASR,
