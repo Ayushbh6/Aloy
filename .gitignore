@@ -1,0 +1,23 @@
+# Local credentials, learner records and runtime data
+.env
+.env.*
+!.env.example
+.local/
+MEMORY.md
+*.sqlite*
+*.db
+recordings/
+models/
+# Python / tooling
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+.DS_Store
