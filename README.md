@@ -20,6 +20,8 @@ open mac/build/Aloy.app
 
 Create `~/Library/Application Support/Aloy/credentials.env` with `GEMINI_API_KEY` and/or `OPENROUTER_API_KEY`, and restrict it with `chmod 600`. An ignored project `.env` remains a fallback for terminal development. The Mac app uses the one runtime under Application Support, where it installs a small wheel of the current source during `mac/build.sh`. The project `.venv` is only a link, so this does not duplicate the speech dependencies. The default is Gemini 3.5 Flash-Lite text, local Qwen3 ASR, and Pocket TTS's German `juergen` voice. OpenRouter DeepSeek V4.1 Flash, Gemini 3.8 Flash, Gemini Flash-Lite TTS, and text-only playback are selectable. If a selected provider is unavailable, Aloy reports the error rather than silently changing models.
 
+The first Record click asks macOS for microphone access. Aloy shows Recording only after capture actually starts; a denied permission remains local and no audio is sent.
+
 The Codex option uses a pinned local `codex` 0.156.1 app-server, a separate Aloy configuration directory, an empty workspace and tool restrictions. Install it once with `npm install --prefix "$runtime/codex-cli" @openai/codex@0.156.1`. For this Mac, Aloy's isolated home links to the existing local ChatGPT login at `~/.codex/auth.json`; the link and credentials stay outside Git. Alternatively, sign in inside Aloy's `codex-home` with the Codex CLI. The global CLI is untouched.
 
 ## Checks and data

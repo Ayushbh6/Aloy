@@ -53,6 +53,7 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
     private var dataRoot: String?
     private var recorder: AVAudioRecorder?
     private var recordedPath: String?
+    private var microphoneRequestPending = false
     private var player: AVAudioPlayer?
     private var audioQueue: [String] = []
     private var replyBuffer = ""
@@ -68,6 +69,7 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
 
     func applicationWillTerminate(_ notification: Notification) {
         recorder?.stop()
+        if let recordedPath { try? FileManager.default.removeItem(atPath: recordedPath) }
         player?.stop()
         backend?.terminate()
     }
@@ -345,7 +347,11 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
         do {
             player = try AVAudioPlayer(contentsOf: URL(fileURLWithPath: path))
             player?.delegate = self
-            player?.play()
+            guard player?.play() == true else {
+                player = nil
+                status.stringValue = "Audio playback could not start"
+                return
+            }
             orb.isSpeaking = true
             status.stringValue = "Speaking…"
         } catch { status.stringValue = "Audio playback failed" }
@@ -353,7 +359,9 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
     func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
         self.player = nil
         orb.isSpeaking = false
-        if audioQueue.isEmpty { status.stringValue = "Ready" } else { playNext() }
+        if !flag { status.stringValue = "Audio playback stopped unexpectedly" }
+        else if audioQueue.isEmpty { status.stringValue = "Ready" }
+        else { playNext() }
     }
 
     private func stopPlayback() {
@@ -406,27 +414,62 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
             status.stringValue = "Transcribing…"
             return
         }
+        guard dataRoot != nil, conversationID != nil, !microphoneRequestPending else { return }
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized:
+            startRecording()
+        case .notDetermined:
+            microphoneRequestPending = true
+            recordButton.isEnabled = false
+            status.stringValue = "Waiting for microphone permission…"
+            AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
+                DispatchQueue.main.async {
+                    guard let self, self.microphoneRequestPending else { return }
+                    self.microphoneRequestPending = false
+                    self.recordButton.isEnabled = true
+                    if granted { self.startRecording() }
+                    else { self.status.stringValue = "Microphone access was not granted" }
+                }
+            }
+        case .denied, .restricted:
+            status.stringValue = "Enable Aloy microphone access in System Settings"
+        @unknown default:
+            status.stringValue = "Microphone permission unavailable"
+        }
+    }
+
+    private func startRecording() {
         guard let root = dataRoot, conversationID != nil else { return }
         stopPlayback()
         command("stop")
         let folder = URL(fileURLWithPath: root).appendingPathComponent("tmp")
         try? FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
         let url = folder.appendingPathComponent(UUID().uuidString + ".m4a")
-        recordedPath = url.path
         do {
-            recorder = try AVAudioRecorder(url: url, settings: [
+            let candidate = try AVAudioRecorder(url: url, settings: [
                 AVFormatIDKey: Int(kAudioFormatMPEG4AAC),
                 AVSampleRateKey: 44100.0, AVNumberOfChannelsKey: 1,
                 AVEncoderAudioQualityKey: AVAudioQuality.high.rawValue,
             ])
-            recorder?.delegate = self
-            recorder?.record(forDuration: 300)
+            guard candidate.record(forDuration: 300) else {
+                try? FileManager.default.removeItem(at: url)
+                status.stringValue = "Microphone could not start recording"
+                return
+            }
+            candidate.delegate = self
+            recorder = candidate
+            recordedPath = url.path
             recordButton.title = "Finish"
             status.stringValue = "Recording… click Finish"
-        } catch { status.stringValue = "Microphone unavailable" }
+        } catch {
+            try? FileManager.default.removeItem(at: url)
+            status.stringValue = "Microphone unavailable"
+        }
     }
 
     @objc private func stopAction() {
+        microphoneRequestPending = false
+        recordButton.isEnabled = true
         recorder?.stop()
         recorder = nil
         if let path = recordedPath { try? FileManager.default.removeItem(atPath: path) }
