@@ -4,6 +4,7 @@ import asyncio
 import base64
 import contextlib
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -38,6 +39,7 @@ class SpeechWorker:
                             stdout=asyncio.subprocess.PIPE,
                             stderr=asyncio.subprocess.DEVNULL,
                             limit=30_000_000,
+                            env={**os.environ, "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"},
                         )
                     self.process.stdin.write((json.dumps(value) + "\n").encode())
                     await self.process.stdin.drain()
@@ -54,17 +56,24 @@ class SpeechWorker:
 
 
 def main():
-    from aloy.speech import MLXTranscriber, PocketSynthesizer
+    from aloy.speech import MLXTranscriber, PocketSynthesizer, QwenSynthesizer
 
     engine = sys.argv[1]
-    model = MLXTranscriber() if engine == "asr" else PocketSynthesizer()
+    if engine.startswith("asr:"):
+        model = MLXTranscriber(engine.split(":", 1)[1])
+    elif engine.startswith("qwen-tts:"):
+        model = QwenSynthesizer(engine.split(":", 1)[1])
+    elif engine == "tts":
+        model = PocketSynthesizer()
+    else:
+        raise ValueError("Unknown speech worker")
     for line in sys.stdin:
         try:
             value = json.loads(line)
             with contextlib.redirect_stdout(sys.stderr):
                 result = (
                     model._transcribe(Path(value))
-                    if engine == "asr"
+                    if engine.startswith("asr:")
                     else base64.b64encode(model._synthesize(value)).decode()
                 )
             packet = {"result": result}

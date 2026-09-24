@@ -9,5 +9,5 @@
   <key>CFBundleVersion</key><string>1</string>
   <key>CFBundleShortVersionString</key><string>0.1</string>
   <key>LSUIElement</key><true/>
-  <key>NSMicrophoneUsageDescription</key><string>Aloy records only when you press Option–Space or click Record, to transcribe your speech and save it in your local conversation.</string>
+  <key>NSMicrophoneUsageDescription</key><string>Aloy records only when you press Option–Z or click Record, to transcribe your speech and save it in your local conversation.</string>
 </dict></plist>

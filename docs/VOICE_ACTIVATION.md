@@ -1,6 +1,7 @@
 # Voice activation
 
-Option + Space is a registered global Carbon hotkey, activated on release. Both
+Option + Z records/sends and Option + X cancels. Both are global Carbon hotkeys,
+activated on release. Option + Space remains available to Codex. Both
 shortcut and button call the existing toggleRecording function: start/finish capture,
 existing recorded transport, local STT, canonical agent stream and selected TTS.
 No new provider pipeline or speech dependencies are added. Starting while speaking
@@ -8,8 +9,9 @@ uses the existing cancellation and operation-ID machinery. The orb indicates cap
 in red and panel visibility is unaffected. Registration errors are explicit.
 
 Native tests exercise held-key repeat and unmatched releases. Python regression
-checks cover the reused backend. The owner confirmed the physical global-shortcut recording/send/spoken-reply flow
-works with another app focused. The local Pocket voice remains a quality issue.
+checks cover the reused backend. The owner verified the earlier Option + Space flow. The replacement Option + Z / X
+combinations require their own physical check; native tests cover independent key
+state and held-key repetition. See OFFLINE_VOICE_REVIEW.md for current speech checks.
 Both Python and native GitHub CI jobs passed; a bounded Gemini smoke check passed
 with exactly one generation request.
 

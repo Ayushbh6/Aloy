@@ -33,7 +33,8 @@ Do not introduce a parallel dependency workflow.
 - Keep the one Mac runtime under Application Support; the project `.venv` is a link.
   `mac/build.sh` installs the current wheel there before compiling the shell. Do not
   put credentials in the app bundle or add a second speech environment.
-- The owner deferred orb visual redesign to a later round. Keep one small orb in this build.
+- Orb redesign is now authorized: keep the existing 56-point footprint, use a dense
+  quiet particle sphere, and make recording/processing/speaking/error states legible.
 
 ## Required testing policy
 
@@ -73,3 +74,16 @@ requires explicit authorization. No application framework implies permission to 
 - Wake words, automatic turn detection and interruption are required for the eventual
   product. The next interaction round may start with a toggle-to-record keyboard shortcut;
   do not claim these features are delivered by the current manual recording controls.
+
+## Current activation priority
+
+One-hand shortcuts only: Option + Z records/sends; Option + X cancels. Option + Space
+belongs to Codex and must not be registered by Aloy. Prioritize agent functionality
+and its supporting capabilities. Hey Aloy voice activation remains planned for a
+soon-following phase, explicitly deferred for now. Do not implement or download
+wake-word components until that phase is requested.
+
+Speech quality work is offline-first. Paid speech is a last resort, never an automatic
+fallback. Detect speech before ASR; no-speech captures must never reach the agent.
+Compare candidates on actual local recordings and human voice auditions; do not claim
+a globally best model from a tiny benchmark. Keep only the selected model weights.

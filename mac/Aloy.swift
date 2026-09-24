@@ -2,42 +2,11 @@ import AppKit
 import AVFoundation
 import Carbon
 
-// A quiet ink panel and one luminous blue orb; the orb breathes while Aloy speaks.
-final class OrbView: NSView {
-    var onClick: (() -> Void)?
-    var isRecording = false { didSet { needsDisplay = true } }
-    var isSpeaking = false { didSet { needsDisplay = true } }
-    private var gesture = OrbGesture()
-    override var isOpaque: Bool { false }
-    override func draw(_ dirtyRect: NSRect) {
-        let outer = bounds.insetBy(dx: 2, dy: 2)
-        NSColor(calibratedRed: 0.22, green: 0.44, blue: 0.94, alpha: isSpeaking ? 0.34 : 0.18).setFill()
-        NSBezierPath(ovalIn: outer).fill()
-        let inner = bounds.insetBy(dx: isSpeaking ? 7 : 9, dy: isSpeaking ? 7 : 9)
-        (isRecording ? NSColor.systemRed : NSColor(calibratedRed: 0.29, green: 0.51, blue: 0.98, alpha: 1)).setFill()
-        NSBezierPath(ovalIn: inner).fill()
-        NSColor.white.withAlphaComponent(0.9).setFill()
-        NSBezierPath(ovalIn: NSRect(x: bounds.midX - 4, y: bounds.midY - 4, width: 8, height: 8)).fill()
-    }
-    override func mouseDown(with event: NSEvent) {
-        gesture.begin(at: window?.convertPoint(toScreen: event.locationInWindow) ?? NSEvent.mouseLocation, windowOrigin: window?.frame.origin ?? .zero)
-    }
-    override func mouseDragged(with event: NSEvent) {
-        gesture.markDragged()
-        let point = window?.convertPoint(toScreen: event.locationInWindow) ?? NSEvent.mouseLocation
-        if let origin = gesture.move(to: point) { window?.setFrameOrigin(origin) }
-    }
-    override func mouseUp(with event: NSEvent) {
-        if gesture.end(at: window?.convertPoint(toScreen: event.locationInWindow) ?? NSEvent.mouseLocation) { onClick?() }
-    }
-
-}
-
 final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDelegate,
                            AVAudioPlayerDelegate, NSTextFieldDelegate {
-    private var hotKey: EventHotKeyRef?
+    private var hotKeys: [EventHotKeyRef] = []
     private var hotKeyHandler: EventHandlerRef?
-    private var shortcutGesture = ShortcutGesture()
+    private var shortcutGestures: [UInt32: ShortcutGesture] = [:]
     private var backend: Process?
     private var backendInput: FileHandle?
     private var orbWindow: NSWindow!
@@ -77,7 +46,7 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
     }
 
     func applicationWillTerminate(_ notification: Notification) {
-        if let hotKey { UnregisterEventHotKey(hotKey) }
+        for hotKey in hotKeys { UnregisterEventHotKey(hotKey) }
         if let hotKeyHandler { RemoveEventHandler(hotKeyHandler) }
         recorder?.stop()
         // Unfinished capture remains in Aloy/tmp for recovery on next launch.
@@ -94,27 +63,36 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
         let installed = InstallEventHandler(GetApplicationEventTarget(), { _, event, context in
             guard let event, let context else { return OSStatus(eventNotHandledErr) }
             let owner = Unmanaged<AppController>.fromOpaque(context).takeUnretainedValue()
+            var key = EventHotKeyID()
+            guard GetEventParameter(event, EventParamName(kEventParamDirectObject),
+                EventParamType(typeEventHotKeyID), nil, MemoryLayout<EventHotKeyID>.size,
+                nil, &key) == noErr, key.signature == 0x414C4F59 else { return OSStatus(eventNotHandledErr) }
             if GetEventKind(event) == UInt32(kEventHotKeyPressed) {
-                owner.shortcutGesture.down()
-            } else if owner.shortcutGesture.up() {
-                owner.toggleRecording()
+                owner.shortcutGestures[key.id, default: ShortcutGesture()].down()
+            } else if owner.shortcutGestures[key.id, default: ShortcutGesture()].up() {
+                if key.id == 1 { owner.toggleRecording() }
+                else { owner.stopAction() }
             }
             return noErr
         }, events.count, &events, context, &hotKeyHandler)
-        let registered = installed == noErr ? RegisterEventHotKey(
-            UInt32(kVK_Space), UInt32(optionKey),
-            EventHotKeyID(signature: 0x414C4F59, id: 1),
-            GetApplicationEventTarget(), 0, &hotKey
-        ) : installed
-        if registered != noErr {
-            status.stringValue = "Option–Space unavailable; use Record"
+        var failed = installed != noErr
+        if !failed {
+            for (id, code) in [(UInt32(1), kVK_ANSI_Z), (UInt32(2), kVK_ANSI_X)] {
+                var reference: EventHotKeyRef?
+                let result = RegisterEventHotKey(UInt32(code), UInt32(optionKey),
+                    EventHotKeyID(signature: 0x414C4F59, id: id), GetApplicationEventTarget(), 0, &reference)
+                if result == noErr, let reference { hotKeys.append(reference) }
+                else { failed = true }
+            }
+        }
+        if failed {
             let alert = NSAlert()
-            alert.messageText = "Aloy could not register Option–Space"
-            alert.informativeText = "Another application may own this shortcut. Record and Finish & Send still work in Aloy's panel."
+            alert.messageText = "An Aloy shortcut is unavailable"
+            alert.informativeText = "Option–Z records/sends; Option–X cancels. Another app may own a shortcut. The panel buttons still work."
             alert.runModal()
         }
-        orb.toolTip = "Option–Space: record / send. Click to open Aloy."
-        recordButton.toolTip = "Option–Space works from other apps too"
+        orb.toolTip = "Option–Z: record/send · Option–X: cancel · Click for chat"
+        recordButton.toolTip = "Option–Z works from other apps too"
     }
 
     private func label(_ title: String, frame: NSRect, size: CGFloat = 12,
@@ -219,7 +197,7 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
         providerPicker.action = #selector(settingsChanged)
         canvas.addSubview(providerPicker)
         speechPicker = NSPopUpButton(frame: NSRect(x: 148, y: 24, width: 105, height: 28))
-        speechPicker.addItems(withTitles: ["Pocket local", "Gemini voice", "Text only"])
+        speechPicker.addItems(withTitles: ["Qwen Ryan", "Qwen Aiden", "Gemini voice", "Text only"])
         speechPicker.target = self
         speechPicker.action = #selector(settingsChanged)
         canvas.addSubview(speechPicker)
@@ -316,7 +294,7 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
                 providerPicker.selectItem(at: index)
             }
             if let speech = settings["speech"],
-               let index = ["pocket", "gemini", "none"].firstIndex(of: speech) {
+               let index = ["qwen", "qwen-aiden", "gemini", "none"].firstIndex(of: speech) {
                 speechPicker.selectItem(at: index)
             }
             if settings["mode"] == "live" { modePicker.selectItem(at: 1) }
@@ -368,6 +346,8 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
                 append("\(role)\(marker): \(body)\n\n")
             }
         case "started":
+            orb.isProcessing = true
+            orb.hasError = false
             replayAssets.removeAll()
             currentRunID = object["run_id"] as? String
             replyBuffer = ""
@@ -396,6 +376,7 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
                 playNext()
             }
         case "turn_done":
+            orb.isProcessing = false
             if player?.isPlaying != true && object["failed"] as? Bool != true {
                 status.stringValue = "Ready"
             }
@@ -415,10 +396,17 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
             alert.runModal()
         case "deleted":
             command("list")
+        case "no_speech":
+            orb.isProcessing = false
+            status.stringValue = "No speech detected — nothing sent"
+            orb.toolTip = status.stringValue
         case "error", "speech_error":
+            orb.hasError = true
+            orb.isProcessing = false
             stopPlayback()
             status.stringValue = object["error"] as? String ?? "Error"
         case "stopped":
+            orb.isProcessing = false
             if recorder == nil { status.stringValue = "Ready" }
         default: break
         }
@@ -463,6 +451,7 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
         let cancelled = audioQueue
         audioQueue.removeAll()
         orb.isSpeaking = false
+        orb.isProcessing = false
         let elapsed = (ProcessInfo.processInfo.systemUptime - began) * 1000
         if let id = playingAssetID { command("playback", ["asset_id": id, "status": "cancelled"]) }
         playingAssetID = nil
@@ -474,7 +463,7 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
         ["gemini", "openrouter", "gemini-quality", "codex", "fake"][providerPicker.indexOfSelectedItem]
     }
     private var speech: String? {
-        let choices = ["pocket", "gemini", "none"]
+        let choices = ["qwen", "qwen-aiden", "gemini", "none"]
         let selected = choices[speechPicker.indexOfSelectedItem]
         return selected == "none" ? nil : selected
     }
@@ -532,7 +521,7 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
         let previous = recorder
         recorder = nil
         orb.isRecording = false
-        orb.toolTip = "Processing — Option–Space to start a new recording"
+        orb.toolTip = "Processing — Option–Z to start a new recording"
         previous?.stop()
         recordButton.title = "Record"
         stopButton.title = "Stop"
@@ -541,6 +530,7 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
         command("recorded", ["conversation_id": id, "path": path,
                              "provider": provider, "speech": speech as Any? ?? NSNull(),
                              "mode": modePicker.indexOfSelectedItem == 1 ? "live" : "standard"])
+        orb.isProcessing = true
         status.stringValue = "Processing recording…"
     }
 
@@ -552,6 +542,7 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
 
     private func startRecording() {
         guard let root = dataRoot, conversationID != nil else { return }
+        orb.hasError = false
         operation.invalidate()
         stopPlayback()
         command("stop")
@@ -572,7 +563,7 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
             candidate.delegate = self
             recorder = candidate
             orb.isRecording = true
-            orb.toolTip = "Recording — Option–Space to send"
+            orb.toolTip = "Recording — Option–Z sends · Option–X cancels"
             recordedPath = url.path
             recordButton.title = "Finish & Send"
             status.stringValue = "Recording… Finish & Send, or Cancel recording"
@@ -584,6 +575,8 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
     }
 
     @objc private func stopAction() {
+        orb.hasError = false
+        orb.isProcessing = false
         operation.invalidate()
         currentRunID = nil
         microphoneRequestPending = false

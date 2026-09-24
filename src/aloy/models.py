@@ -7,9 +7,24 @@ from pathlib import Path
 from aloy.storage import data_root
 
 MODELS = {
+    "qwen-tts": (
+        "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit",
+        "41d3337e8b7f2843a75841595fc14e4b9a7a4b96",
+        ["*.json", "*.safetensors", "*.txt"],
+    ),
+    "vad": (
+        "mlx-community/Silero-VAD",
+        "7bc17f22d3c0451bd3a6cd71e759b009271ff49a",
+        ["config.json", "model.safetensors"],
+    ),
+    "parakeet": (
+        "mlx-community/parakeet-tdt-0.6b-v3",
+        "ed2b7e8c15f9aaa0b5772e2efb986255eaef7e15",
+        ["*.json", "*.safetensors", "*.model", "*.vocab", "*.txt"],
+    ),
     "qwen-asr": (
-        "mlx-community/Qwen3-ASR-0.6B-8bit",
-        "89e96d92ba34aca20b3e29fb10cc284097d1219f",
+        "mlx-community/Qwen3-ASR-1.7B-8bit",
+        "a8379a2e2f9e313c9292cdf1af4055ab56d50d55",
         ["*.json", "*.safetensors", "*.model", "*.tiktoken", "*.txt"],
     ),
     "pocket-german": (
@@ -23,6 +38,9 @@ MODELS = {
         ],
     ),
 }
+
+
+DEFAULT_MODELS = ("vad", "qwen-asr", "qwen-tts")
 
 
 def cache_dir() -> Path:
@@ -49,7 +67,7 @@ def prune_unselected() -> int:
     hub = cache_dir().resolve()
     if not hub.exists():
         return 0
-    selected = {"models--" + repo.replace("/", "--") for repo, _, _ in MODELS.values()}
+    selected = {"models--" + MODELS[name][0].replace("/", "--") for name in DEFAULT_MODELS}
     for directory in hub.glob("models--*"):
         if directory.name not in selected and directory.is_dir():
             shutil.rmtree(directory)
@@ -86,7 +104,7 @@ def main() -> None:
     if args.prune:
         print(f"Reclaimed {prune_unselected() / 1024**3:.2f} GiB from unused Aloy models")
         return
-    for name in args.names or MODELS:
+    for name in args.names or DEFAULT_MODELS:
         print(f"{name}: {model_path(name, local_only=False)}", flush=True)
 
 

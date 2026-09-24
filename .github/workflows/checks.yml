@@ -22,5 +22,5 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
-      - run: swiftc mac/InteractionState.swift mac/tests/main.swift -o "$RUNNER_TEMP/aloy-check" && "$RUNNER_TEMP/aloy-check"
-      - run: swiftc -swift-version 5 mac/Aloy.swift mac/InteractionState.swift -framework AppKit -framework AVFoundation -o "$RUNNER_TEMP/Aloy"
+      - run: swiftc mac/InteractionState.swift mac/OrbView.swift mac/tests/main.swift -framework AppKit -o "$RUNNER_TEMP/aloy-check" && "$RUNNER_TEMP/aloy-check"
+      - run: swiftc -swift-version 5 mac/Aloy.swift mac/OrbView.swift mac/InteractionState.swift -framework AppKit -framework AVFoundation -o "$RUNNER_TEMP/Aloy"

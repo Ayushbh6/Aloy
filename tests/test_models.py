@@ -9,7 +9,7 @@ def test_prune_only_unselected_aloy_cache(tmp_path, monkeypatch):
     unused = blobs / "unused"
     keep.write_bytes(b"retained")
     unused.write_bytes(b"unselected")
-    selected = hub / "models--mlx-community--Qwen3-ASR-0.6B-8bit" / "snapshots" / "pin"
+    selected = hub / "models--mlx-community--Qwen3-ASR-1.7B-8bit" / "snapshots" / "pin"
     selected.mkdir(parents=True)
     (selected / "model.safetensors").symlink_to(keep)
     discarded = hub / "models--mlx-community--whisper-large-v3-turbo" / "snapshots" / "pin"

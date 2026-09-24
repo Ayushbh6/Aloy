@@ -65,18 +65,40 @@ def to_16k_wav(input_path: Path) -> bytes:
 
 
 class MLXTranscriber:
-    def __init__(self) -> None:
+    def __init__(self, model_name: str = "qwen-asr") -> None:
+        self.model_name = model_name
         self._model = None
+        self._vad = None
         self._lock = threading.Lock()
-        self.worker = SpeechWorker("asr")
+        self.worker = SpeechWorker("asr:" + model_name)
 
     def _transcribe(self, audio_path: Path) -> str:
         from mlx_audio.stt.utils import load_model
 
         with self._lock:
+            # Detect actual speech before asking a generative recognizer to decode it.
+            # A failure to load VAD must fail closed, never bypass the gate.
+            if self._vad is None:
+                from mlx_audio.vad.utils import load_model as load_vad
+
+                self._vad = load_vad(model_path("vad"))
+            detection = self._vad.generate(
+                str(audio_path),
+                threshold=0.6,
+                min_speech_duration_ms=180,
+                min_silence_duration_ms=160,
+                speech_pad_ms=100,
+            )
+            if not detection.timestamps:
+                return ""
             if self._model is None:
-                self._model = load_model(model_path("qwen-asr"))
-            result = self._model.generate(str(audio_path))
+                self._model = load_model(model_path(self.model_name))
+            options = (
+                {"system_prompt": "Aloy, Ayush. English and German conversation."}
+                if self.model_name == "qwen-asr"
+                else {}
+            )
+            result = self._model.generate(str(audio_path), **options)
             return result.text.strip()
 
     async def transcribe(self, audio_path: Path) -> str:
@@ -119,6 +141,45 @@ class PocketSynthesizer:
     def unload(self) -> None:
         self._model = None
         self._voice = None
+
+
+class QwenSynthesizer:
+    """One reusable local TTS adapter; voice variants share weights and code."""
+
+    def __init__(self, voice: str = "Ryan") -> None:
+        self.voice = voice
+        self._model = None
+        self.worker = SpeechWorker("qwen-tts:" + voice)
+
+    def _synthesize(self, text: str) -> bytes:
+        import mlx.core as mx
+        from mlx_audio.tts.utils import load_model
+
+        if self._model is None:
+            self._model = load_model(model_path("qwen-tts"))
+        chunks = list(
+            self._model.generate_custom_voice(
+                text=text,
+                speaker=self.voice,
+                language="auto",
+                instruct=(
+                    "Speak naturally and clearly, like a friendly young adult. "
+                    "Warm conversational tone, no theatrical delivery."
+                ),
+                temperature=0.65,
+                max_tokens=2048,
+            )
+        )
+        if not chunks:
+            raise RuntimeError("Local TTS returned no audio")
+        return pcm_to_wav(mx.concatenate([chunk.audio for chunk in chunks]), chunks[0].sample_rate)
+
+    async def synthesize(self, text: str) -> bytes:
+        return base64.b64decode(await self.worker.request(text))
+
+    async def close(self) -> None:
+        await self.worker.close()
+        self._model = None
 
 
 class GeminiSynthesizer:
@@ -172,6 +233,8 @@ class GeminiSynthesizer:
 
 
 def make_synthesizer(name: str) -> Synthesizer:
+    if name in {"qwen", "qwen-aiden"}:
+        return QwenSynthesizer("Aiden" if name == "qwen-aiden" else "Ryan")
     if name == "gemini":
         return GeminiSynthesizer()
     if name == "pocket":

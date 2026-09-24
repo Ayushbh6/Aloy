@@ -8,7 +8,7 @@ if [[ ! -x "$runtime_dir/venv/bin/python" ]]; then
 fi
 "$runtime_dir/venv/bin/python" -m pip install --quiet --no-deps --no-build-isolation .
 mkdir -p mac/build/Aloy.app/Contents/MacOS mac/build/Aloy.app/Contents/Resources
-swiftc -swift-version 5 mac/Aloy.swift mac/InteractionState.swift -framework AppKit -framework AVFoundation \
+swiftc -swift-version 5 mac/Aloy.swift mac/OrbView.swift mac/InteractionState.swift -framework AppKit -framework AVFoundation \
   -o mac/build/Aloy.app/Contents/MacOS/Aloy
 cp mac/Info.plist mac/build/Aloy.app/Contents/Info.plist
 cat > mac/build/Aloy.app/Contents/Resources/launch.json <<EOF

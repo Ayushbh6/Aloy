@@ -357,3 +357,86 @@ def test_dated_rates_and_live_usage():
     assert model_rates("gemini-3.8-flash", "2027-01-01") == (1.5, 7.5)
     assert live_cost(100, 100) == pytest.approx(0.0015)
     assert live_cost(None, 100) is None
+
+
+def test_silence_does_not_dispatch_or_enter_history(tmp_path, monkeypatch):
+    import io
+    import wave
+
+    payload = io.BytesIO()
+    with wave.open(payload, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(16000)
+        wav.writeframes(b"\0\0" * 16000)
+
+    async def scenario():
+        monkeypatch.setenv("ALOY_DATA_DIR", str(tmp_path))
+        monkeypatch.setattr("aloy.bridge.to_16k_wav", lambda _: payload.getvalue())
+        bridge = Bridge()
+        events = []
+        bridge.emit = lambda event, **kw: events.append(event)
+
+        async def silence(_):
+            return ""
+
+        async def forbidden(*args, **kwargs):
+            raise AssertionError("Silent capture dispatched a turn")
+
+        bridge.transcriber.transcribe = silence
+        bridge.run_turn = forbidden
+        cid = bridge.store.create_conversation("Synthetic")
+        path = tmp_path / "tmp" / "silence.wav"
+        path.parent.mkdir()
+        path.write_bytes(payload.getvalue())
+        await bridge.transcribe_and_run(cid, path, "fake", "qwen", bridge.epoch)
+        assert "no_speech" in events
+        assert "transcript" not in events
+        assert not bridge.store.completed_history(cid)
+        assert bridge.store.monthly_spend() == 0
+        assert len(bridge.store.audio_assets(cid)) == 1
+        bridge.store.close()
+
+    asyncio.run(scenario())
+
+
+def test_vad_rejection_precedes_asr_load(monkeypatch, tmp_path):
+    import sys
+    from types import ModuleType, SimpleNamespace
+
+    from aloy.speech import MLXTranscriber
+
+    module = ModuleType("mlx_audio.stt.utils")
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("ASR loaded for non-speech")
+
+    module.load_model = forbidden
+    monkeypatch.setitem(sys.modules, "mlx_audio.stt.utils", module)
+    transcriber = MLXTranscriber()
+    transcriber._vad = SimpleNamespace(
+        generate=lambda *args, **kwargs: SimpleNamespace(timestamps=[])
+    )
+    assert transcriber._transcribe(tmp_path / "synthetic.wav") == ""
+
+
+def test_vad_failure_cannot_bypass_gate(monkeypatch, tmp_path):
+    import sys
+    from types import ModuleType, SimpleNamespace
+
+    from aloy.speech import MLXTranscriber
+
+    module = ModuleType("mlx_audio.stt.utils")
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("ASR loaded after detector failure")
+
+    def detector_failure(*args, **kwargs):
+        raise RuntimeError("Detector unavailable")
+
+    module.load_model = forbidden
+    monkeypatch.setitem(sys.modules, "mlx_audio.stt.utils", module)
+    transcriber = MLXTranscriber()
+    transcriber._vad = SimpleNamespace(generate=detector_failure)
+    with pytest.raises(RuntimeError, match="Detector unavailable"):
+        transcriber._transcribe(tmp_path / "synthetic.wav")
