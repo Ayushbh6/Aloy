@@ -8,8 +8,10 @@ uses the existing cancellation and operation-ID machinery. The orb indicates cap
 in red and panel visibility is unaffected. Registration errors are explicit.
 
 Native tests exercise held-key repeat and unmatched releases. Python regression
-checks cover the reused backend. A physical global-shortcut check remains required;
-our UI automation tool cannot emit system-wide hotkeys.
+checks cover the reused backend. The owner confirmed the physical global-shortcut recording/send/spoken-reply flow
+works with another app focused. The local Pocket voice remains a quality issue.
+Both Python and native GitHub CI jobs passed; a bounded Gemini smoke check passed
+with exactly one generation request.
 
 ## Wake-word feasibility
 
