@@ -24,8 +24,32 @@ Do not introduce a parallel dependency workflow.
   authority ceilings, shared budget accounting, cancellation and bounded depth.
 - Every implementation change includes appropriate checks and meaningful behavior
   tests for changed runtime behavior. No duplicate code path to make a test pass.
-- Current scope is environment setup and planning. Do not infer approval to implement
-  the whole application, download models, deploy services or enable background jobs.
+- The owner explicitly approved implementing the first companion and speech foundation
+  in docs/INITIAL_PLAN.md. Curriculum, generative lesson visuals, tools, screen context,
+  wake words and background jobs remain deferred until separately scoped.
+- Keep Aloy's local footprint lean. Download only selected weight files into its dedicated
+  cache. After comparisons, remove losing models, stale temporary files and unneeded build
+  artifacts; preserve conversations and user recordings. Never prune unrelated caches.
+- Keep the one Mac runtime under Application Support; the project `.venv` is a link.
+  `mac/build.sh` installs the current wheel there before compiling the shell. Do not
+  put credentials in the app bundle or add a second speech environment.
+- The owner deferred orb visual redesign to a later round. Keep one small orb in this build.
+
+## Required testing policy
+
+- Follow the canonical two-mode testing contract in docs/ENGINEERING.md.
+- Default `fake` mode is deterministic, offline and free; explicit `live` mode runs
+  one bounded cheap-provider generation request through the same production pipeline.
+- Select the mode in the test harness through dependency injection, never a parallel
+  implementation or production-wide testing flag. Ordinary CI must remain offline.
+- Before closing a provider-backed feature, relevant unit tests AND the applicable
+  live integration check must pass. Missing credentials or a skipped/failed live check
+  are an unverified result, never a fake-backed success. Documentation-only changes
+  do not require spending money on a live call.
+- Enforce the live request cap across SDK retries, continuations and model fallbacks.
+  Use synthetic input, output/cost limits, a timeout and secret-safe usage evidence.
+- One live call verifies only its exercised path. Multi-turn/tool scenarios need
+  separately bounded integration tests; do not silently expand the one-call check.
 
 ## Data and workflow
 

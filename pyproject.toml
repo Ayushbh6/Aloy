@@ -8,7 +8,10 @@ version = "0.0.1"
 description = "A modular personal desktop companion and visual voice tutor."
 readme = "README.md"
 requires-python = ">=3.13,<3.14"
-dependencies = []
+dependencies = ["google-genai==2.25.0", "openai==3.19.2"]
+
+[project.optional-dependencies]
+speech = ["mlx-audio==0.5.6", "pocket-tts==3.3.0"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/aloy"]

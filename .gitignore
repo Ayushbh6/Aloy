@@ -9,7 +9,7 @@ MEMORY.md
 recordings/
 models/
 # Python / tooling
-.venv/
+.venv
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -19,5 +19,6 @@ __pycache__/
 htmlcov/
 dist/
 build/
+mac/build/
 *.egg-info/
 .DS_Store

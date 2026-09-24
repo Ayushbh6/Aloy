@@ -1,35 +1,45 @@
 # Aloy
 
-A personal desktop companion with spoken interaction, coordinated teaching visuals,
-persistent context, and scheduled follow-through. The first intended use is a German tutor.
+A small Mac companion with a draggable orb, saved text conversations, local speech, and an explicit Gemini Live audio mode. The first text agent is deliberately simple: system prompt plus the selected conversation's ordered history and the new message produce one streamed answer. Python owns the agent and storage; the Swift/AppKit shell owns the microphone, windows and playback.
 
-## Status
+## Run locally
 
-Foundation only: installable Python package, pinned development dependencies,
-engineering rules and an implementation plan. No agent, voice service, scheduler,
-model connection or desktop interface is implemented yet.
-
-## Development
-
-Requires Python 3.13. Use standard venv and pip.
+Requires macOS on Apple Silicon, Python 3.13, Swift and FFmpeg.
 
 ```sh
-python3.13 -m venv .venv
-source .venv/bin/activate
-python -m pip install -r requirements-dev.txt
-python -m pip install -e .
-python -m pip check
-python -m ruff check .
-python -m ruff format --check .
-python -c "import aloy; print(aloy.__file__)"
+runtime="$HOME/Library/Application Support/Aloy/runtime"
+mkdir -p "$runtime"
+python3.13 -m venv "$runtime/venv"
+ln -s "$runtime/venv" .venv
+.venv/bin/python -m pip install -r requirements-dev.txt
+.venv/bin/python -m pip install -e '.[speech]'
+.venv/bin/python -m aloy.models qwen-asr pocket-german
+zsh mac/build.sh
+open mac/build/Aloy.app
 ```
 
-Pytest is installed for meaningful behavioral tests as the runtime is implemented.
-There are currently no behavioral tests or working application to launch.
-GitHub Actions repeats the environment, lint, format and import checks on pushes and PRs.
-No API key is needed for this scaffold. Copy `.env.example` to `.env` only when
-configuring a provider. Credentials and personal learner data must never enter Git.
+Create `~/Library/Application Support/Aloy/credentials.env` with `GEMINI_API_KEY` and/or `OPENROUTER_API_KEY`, and restrict it with `chmod 600`. An ignored project `.env` remains a fallback for terminal development. The Mac app uses the one runtime under Application Support, where it installs a small wheel of the current source during `mac/build.sh`. The project `.venv` is only a link, so this does not duplicate the speech dependencies. The default is Gemini 3.5 Flash-Lite text, local Qwen3 ASR, and Pocket TTS's German `juergen` voice. OpenRouter DeepSeek V4.1 Flash, Gemini 3.8 Flash, Gemini Flash-Lite TTS, and text-only playback are selectable. If a selected provider is unavailable, Aloy reports the error rather than silently changing models.
 
-Read [AGENTS.md](AGENTS.md), [engineering rules](docs/ENGINEERING.md),
-and the [initial plan](docs/INITIAL_PLAN.md) before making changes.
-Local operators may also have an ignored `MEMORY.md` and `.local/` context directory.
+The Codex option uses a pinned local `codex` 0.156.1 app-server, a separate Aloy configuration directory, an empty workspace and tool restrictions. Install it once with `npm install --prefix "$runtime/codex-cli" @openai/codex@0.156.1`. For this Mac, Aloy's isolated home links to the existing local ChatGPT login at `~/.codex/auth.json`; the link and credentials stay outside Git. Alternatively, sign in inside Aloy's `codex-home` with the Codex CLI. The global CLI is untouched.
+
+## Checks and data
+
+```sh
+.venv/bin/ruff check src tests
+.venv/bin/ruff format --check src tests
+.venv/bin/pytest -q
+.venv/bin/python -m aloy.smoke                    # offline fake, default
+.venv/bin/python -m aloy.smoke --mode live --provider gemini
+.venv/bin/python -m aloy.smoke --mode live --provider openrouter
+.venv/bin/python -m aloy.smoke --mode live --provider codex
+```
+
+Each direct-provider live smoke command uses one synthetic, capped text request with retries and fallback disabled. Codex is a separately labelled provider-managed turn. Normal tests never use the network. Recordings, transcripts, run status and an independent spend ledger live under `~/Library/Application Support/Aloy`. Deleting a conversation removes its recordings and messages, while retaining spend estimates so deletion cannot reset the monthly $30 ceiling. Aloy warns at $20. These are estimates, not billing records.
+
+The selected offline weights occupy about 1.2 GiB. `.venv/bin/python -m aloy.models --prune` removes unselected weights from Aloy's dedicated cache. It does not touch other Hugging Face caches or the user's files. The one Python environment and pinned Codex CLI are also needed to run this build.
+
+Experimental pronunciation feedback accepts a short mono 16 kHz WAV recording with `python -m aloy.pronunciation path.wav 'expected German phrase'`. It sends the actual audio to Gemini through the Interactions API and stores the result locally. It is coaching feedback, not a validated score.
+
+## Current boundary
+
+Live audio is a bounded, click-to-record native audio exchange after recording stops. The first build does not stream microphone frames while you speak. The measured synthetic Gemini Lite plus Pocket route reached first audio in about 4.7 seconds on this Mac, above the three-second target. German curriculum, learner mastery, generative lesson visuals, screen context, wake words and proactive reminders remain future work. See [engineering rules](docs/ENGINEERING.md), [implementation plan](docs/INITIAL_PLAN.md), and [first-build evidence](docs/BUILD_EVIDENCE.md).

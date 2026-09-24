@@ -1,6 +1,13 @@
 # Initial infrastructure plan
 
-Status: proposed implementation sequence; only the development scaffold is set up.
+Status: earlier long-range architecture roadmap. The approved first companion build is
+described in [FIRST_BUILD_SCOPE.md](FIRST_BUILD_SCOPE.md) and its measured results in
+[BUILD_EVIDENCE.md](BUILD_EVIDENCE.md). This roadmap's tool, scheduler, canvas and
+subagent phases remain future work.
+
+All phases follow the fake/live testing contract in docs/ENGINEERING.md. Build the
+offline harness in phase 1 and an explicitly selected, one-generation-request live
+check in phase 2. Both inject their provider into the same production runtime.
 
 ## 1. Core contracts and deterministic execution
 
