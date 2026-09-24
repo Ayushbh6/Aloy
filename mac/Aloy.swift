@@ -110,6 +110,7 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
                           width: 400, height: 525)
         panel = NSWindow(contentRect: rect, styleMask: [.titled, .closable, .resizable],
                          backing: .buffered, defer: false)
+        panel.isReleasedWhenClosed = false
         panel.title = "Aloy"
         panel.level = .floating
         panel.minSize = NSSize(width: 380, height: 500)

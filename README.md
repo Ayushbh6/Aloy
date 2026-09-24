@@ -22,6 +22,8 @@ Create `~/Library/Application Support/Aloy/credentials.env` with `GEMINI_API_KEY
 
 The first Record click asks macOS for microphone access. Aloy shows Recording only after capture actually starts; a denied permission remains local and no audio is sent.
 
+Aloy runs when you open the app and remains available as one floating orb while its process is alive. Closing the chat panel leaves the orb running; click it to reopen the panel. This first build has no login item or automatic crash restart yet.
+
 The Codex option uses a pinned local `codex` 0.156.1 app-server, a separate Aloy configuration directory, an empty workspace and tool restrictions. Install it once with `npm install --prefix "$runtime/codex-cli" @openai/codex@0.156.1`. For this Mac, Aloy's isolated home links to the existing local ChatGPT login at `~/.codex/auth.json`; the link and credentials stay outside Git. Alternatively, sign in inside Aloy's `codex-home` with the Codex CLI. The global CLI is untouched.
 
 ## Checks and data
