@@ -10,7 +10,9 @@ import wave
 from pathlib import Path
 from typing import Protocol
 
+from aloy.dispatch import DispatchBudget, gemini_client
 from aloy.models import cache_dir, model_path
+from aloy.speech_worker import SpeechWorker
 
 os.environ.setdefault("HF_HOME", str(cache_dir().parent))
 
@@ -66,6 +68,7 @@ class MLXTranscriber:
     def __init__(self) -> None:
         self._model = None
         self._lock = threading.Lock()
+        self.worker = SpeechWorker("asr")
 
     def _transcribe(self, audio_path: Path) -> str:
         from mlx_audio.stt.utils import load_model
@@ -77,7 +80,11 @@ class MLXTranscriber:
             return result.text.strip()
 
     async def transcribe(self, audio_path: Path) -> str:
-        return await asyncio.to_thread(self._transcribe, audio_path)
+        return await self.worker.request(str(audio_path))
+
+    async def close(self) -> None:
+        await self.worker.close()
+        self.unload()
 
     def unload(self) -> None:
         self._model = None
@@ -88,6 +95,7 @@ class PocketSynthesizer:
         self._model = None
         self._voice = None
         self._lock = threading.Lock()
+        self.worker = SpeechWorker("tts")
 
     def _synthesize(self, text: str) -> bytes:
         from pocket_tts import TTSModel
@@ -102,7 +110,11 @@ class PocketSynthesizer:
             return pcm_to_wav(audio.numpy(), self._model.sample_rate)
 
     async def synthesize(self, text: str) -> bytes:
-        return await asyncio.to_thread(self._synthesize, text)
+        return base64.b64decode(await self.worker.request(text))
+
+    async def close(self) -> None:
+        await self.worker.close()
+        self.unload()
 
     def unload(self) -> None:
         self._model = None
@@ -111,16 +123,21 @@ class PocketSynthesizer:
 
 class GeminiSynthesizer:
     def __init__(self, api_key: str | None = None, voice: str = "Charon") -> None:
-        from google import genai
 
         api_key = api_key or os.environ.get("GEMINI_API_KEY")
         if not api_key:
             raise ValueError("GEMINI_API_KEY is missing")
-        self.client = genai.Client(api_key=api_key)
+        self.client = gemini_client(api_key)
+        self.dispatch = DispatchBudget()
         self.voice = voice
+
+    async def close(self):
+        await self.client.aio.aclose()
+        self.client.close()
 
     async def synthesize(self, text: str) -> bytes:
         async with asyncio.timeout(45):
+            self.dispatch.consume()
             interaction = await self.client.aio.interactions.create(
                 model="gemini-3.8-flash-lite-tts",
                 input=[
@@ -141,7 +158,10 @@ class GeminiSynthesizer:
                     }
                 ],
                 response_format={"type": "audio"},
-                generation_config={"speech_config": [{"voice": self.voice}]},
+                generation_config={
+                    "speech_config": [{"voice": self.voice}],
+                    "max_output_tokens": 2048,
+                },
             )
         if not interaction.output_audio or not interaction.output_audio.data:
             raise RuntimeError("Gemini TTS returned no audio")

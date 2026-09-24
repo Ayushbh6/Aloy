@@ -1,6 +1,6 @@
 # First companion build
 
-The first build implements the user-approved text and speech foundation without an agent framework. Aloy's own `ChatAgent` assembles the full selected conversation history, dispatches one provider response, records the run, and emits the same streamed events consumed by `reply()` and the desktop bridge. It has no tools or continuation loop.
+The first build implements the user-approved text and speech foundation without an agent framework. Aloy's own `ChatAgent` assembles the full selected conversation history, dispatches one provider response, uses the shared RunLifecycle to record the run, and emits the same streamed events consumed by `reply()` and the desktop bridge. It has no tools or continuation loop.
 
 ```python
 from aloy import AgentConfig, ChatAgent, ConversationStore
@@ -28,4 +28,4 @@ The explicit Live audio mode is a native `gemini-3.8-live` session. It bypasses 
 
 Future German teaching features attach to existing seams: the lesson canvas consumes versioned response events; learner evidence and review plans belong behind new repository interfaces; a scheduler or keyboard/wake trigger starts a run through the canonical conversation service; tools, skills, MCP, image inputs and subagents extend validated agent configuration and the same execution pipeline. The first build intentionally does not declare those capabilities implemented.
 
-The offline fake suite runs in CI. Selected live text checks dispatch one synthetic capped request through the production path; Codex is separately labelled as a provider-managed turn. TTS, Live and pronunciation have separately bounded checks. See [BUILD_EVIDENCE.md](BUILD_EVIDENCE.md) for measured results and [ENGINEERING.md](ENGINEERING.md) for the change gate.
+The offline fake suite runs in CI. Selected live text checks dispatch one synthetic capped request through the production path; Codex is separately labelled as a provider-managed turn. TTS, Live and pronunciation have separately bounded checks. See [REPAIR_REVIEW.md](REPAIR_REVIEW.md) for current verification and limits and [ENGINEERING.md](ENGINEERING.md) for the change gate.

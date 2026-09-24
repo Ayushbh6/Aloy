@@ -6,7 +6,7 @@ import os
 from collections.abc import AsyncIterator
 from pathlib import Path
 
-from aloy.contracts import AgentConfig, Message, ProviderEvent
+from aloy.contracts import AgentConfig, ContextOverflowError, Message, ProviderEvent
 from aloy.storage import ConversationStore, data_root
 
 DISABLED_FEATURES = (
@@ -53,6 +53,15 @@ class CodexProvider:
         return command
 
     async def _preflight(self, environment: dict[str, str]) -> None:
+        version = await asyncio.create_subprocess_exec(
+            str(self.cli),
+            "--version",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        output, _ = await version.communicate()
+        if version.returncode != 0 or output.decode().strip() != "codex-cli 0.156.1":
+            raise RuntimeError("Aloy requires its pinned Codex CLI 0.156.1")
         login = await asyncio.create_subprocess_exec(
             str(self.cli),
             "login",
@@ -140,6 +149,31 @@ class CodexProvider:
             )
             process.stdin.write(b'{"method":"initialized"}\n')
             await process.stdin.drain()
+            effective = await response(await send("config/read", {"includeLayers": False}))
+            config_data = effective.get("config", {})
+            if any(
+                item.get("enabled", True) for item in config_data.get("mcp_servers", {}).values()
+            ):
+                raise RuntimeError("Aloy's isolated Codex config contains enabled MCP servers")
+            skill_params = {"cwds": [str(self.workspace)], "forceReload": True}
+            skills = await response(await send("skills/list", skill_params))
+            for group in skills.get("data", []):
+                if group.get("errors"):
+                    raise RuntimeError("Could not verify Codex skills")
+                for skill in group.get("skills", []):
+                    if skill.get("enabled", True):
+                        await response(
+                            await send(
+                                "skills/config/write", {"path": skill["path"], "enabled": False}
+                            )
+                        )
+            skills = await response(await send("skills/list", skill_params))
+            if any(
+                skill.get("enabled", True)
+                for group in skills.get("data", [])
+                for skill in group.get("skills", [])
+            ):
+                raise RuntimeError("Codex skills were not disabled")
             session = self.store.get_session(conversation_id, f"codex:{config.model}")
             if session and session["synced_sequence"] == len(messages) - 1:
                 result = await response(
@@ -208,6 +242,8 @@ class CodexProvider:
                         yield ProviderEvent("delta", delta)
                 elif method == "item/started":
                     item_type = packet.get("params", {}).get("item", {}).get("type")
+                    if item_type == "contextCompaction":
+                        raise ContextOverflowError("Codex attempted context compaction")
                     if item_type and item_type not in (
                         "userMessage",
                         "agentMessage",
@@ -218,6 +254,13 @@ class CodexProvider:
                 elif method == "turn/completed":
                     status = packet.get("params", {}).get("turn", {}).get("status")
                     if status != "completed":
+                        if (
+                            "context"
+                            in str(
+                                packet.get("params", {}).get("turn", {}).get("error", "")
+                            ).lower()
+                        ):
+                            raise ContextOverflowError()
                         raise RuntimeError(f"Codex turn ended with status {status}")
                     if not emitted:
                         raise RuntimeError("Codex returned no final text")

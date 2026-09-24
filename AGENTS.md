@@ -58,3 +58,18 @@ captures, personal memory, account data, local machine diagnostics or databases.
 Keep source changes narrow and preserve unrelated work. Do not reset, stash or discard.
 Research/read-only inspection is allowed. Sending messages or other external actions
 requires explicit authorization. No application framework implies permission to act.
+
+## Repair invariants
+
+- Read docs/REPAIR_REVIEW.md for current verification; older BUILD_EVIDENCE is historical.
+- Keep SQLite mutations in the explicit transaction helper. New migrations are numbered
+  package SQL files. Only the exclusive desktop backend invokes recovery.
+- All paid paths reserve and settle through the shared ledger; incomplete dispatched work
+  retains a conservative allowance. Never report a zero cost merely because usage is absent.
+- Test source via pytest's configured pythonpath; mac/build.sh installs a wheel, so the
+  environment may also contain an older installed package during development.
+- Tag asynchronous transport events with operation IDs. A stop/mode change invalidates old
+  playback and events. Cancel recording retains the audio locally; Finish & Send transcribes.
+- Wake words, automatic turn detection and interruption are required for the eventual
+  product. The next interaction round may start with a toggle-to-record keyboard shortcut;
+  do not claim these features are delivered by the current manual recording controls.

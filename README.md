@@ -20,7 +20,7 @@ open mac/build/Aloy.app
 
 Create `~/Library/Application Support/Aloy/credentials.env` with `GEMINI_API_KEY` and/or `OPENROUTER_API_KEY`, and restrict it with `chmod 600`. An ignored project `.env` remains a fallback for terminal development. The Mac app uses the one runtime under Application Support, where it installs a small wheel of the current source during `mac/build.sh`. The project `.venv` is only a link, so this does not duplicate the speech dependencies. The default is Gemini 3.5 Flash-Lite text, local Qwen3 ASR, and Pocket TTS's German `juergen` voice. OpenRouter DeepSeek V4.1 Flash, Gemini 3.8 Flash, Gemini Flash-Lite TTS, and text-only playback are selectable. If a selected provider is unavailable, Aloy reports the error rather than silently changing models.
 
-The first Record click asks macOS for microphone access. Aloy shows Recording only after capture actually starts; a denied permission remains local and no audio is sent.
+The first Record click asks macOS for microphone access. Aloy shows Recording only after capture starts. Use **Finish & Send** to transcribe/send, or **Cancel recording** to keep the recording locally without sending it. Right-click Replay to hear the last input recording; a normal click replays the last reply. Development rebuilds may prompt for microphone permission again.
 
 Aloy runs when you open the app and remains available as one floating orb while its process is alive. Closing the chat panel leaves the orb running; click it to reopen the panel. This first build has no login item or automatic crash restart yet.
 
@@ -38,7 +38,7 @@ The Codex option uses a pinned local `codex` 0.156.1 app-server, a separate Aloy
 .venv/bin/python -m aloy.smoke --mode live --provider codex
 ```
 
-Each direct-provider live smoke command uses one synthetic, capped text request with retries and fallback disabled. Codex is a separately labelled provider-managed turn. Normal tests never use the network. Recordings, transcripts, run status and an independent spend ledger live under `~/Library/Application Support/Aloy`. Deleting a conversation removes its recordings and messages, while retaining spend estimates so deletion cannot reset the monthly $30 ceiling. Aloy warns at $20. These are estimates, not billing records.
+Each direct-provider live smoke command uses one synthetic, capped text request with retries and fallback disabled. Codex is a separately labelled provider-managed turn. Normal tests never use the network. Recordings, transcripts, run status and an independent spend ledger live under `~/Library/Application Support/Aloy`. Deleting a conversation removes its recordings and messages, while retaining the spend ledger. Persistent reservations prevent concurrent work from bypassing the estimated $30 monthly allowance; uncertain dispatched work remains conservatively accounted. Aloy warns at $20. These are estimates and reservations, not billing records. Synthetic smoke conversations are removed after each check while their spending remains accounted.
 
 The selected offline weights occupy about 1.2 GiB. `.venv/bin/python -m aloy.models --prune` removes unselected weights from Aloy's dedicated cache. It does not touch other Hugging Face caches or the user's files. The one Python environment and pinned Codex CLI are also needed to run this build.
 
@@ -46,4 +46,4 @@ Experimental pronunciation feedback accepts a short mono 16 kHz WAV recording wi
 
 ## Current boundary
 
-Live audio is a bounded, click-to-record native audio exchange after recording stops. The first build does not stream microphone frames while you speak. The measured synthetic Gemini Lite plus Pocket route reached first audio in about 4.7 seconds on this Mac, above the three-second target. German curriculum, learner mastery, generative lesson visuals, screen context, wake words and proactive reminders remain future work. See [engineering rules](docs/ENGINEERING.md), [implementation plan](docs/INITIAL_PLAN.md), and [first-build evidence](docs/BUILD_EVIDENCE.md).
+Live audio is a bounded, click-to-record native audio exchange after recording stops. The first build does not stream microphone frames while you speak. The repaired warm Gemini Lite plus Pocket route emitted first audio in a median 1.11 seconds across three tiny synthetic samples; this excludes microphone/STT time and is not an acoustic latency measurement. German curriculum, learner mastery, generative lesson visuals, screen context, wake words and proactive reminders remain future work. See [engineering rules](docs/ENGINEERING.md), [implementation plan](docs/INITIAL_PLAN.md), and the current [repair review](docs/REPAIR_REVIEW.md).

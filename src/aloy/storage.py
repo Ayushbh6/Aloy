@@ -6,7 +6,9 @@ import hashlib
 import os
 import sqlite3
 import uuid
+from contextlib import contextmanager
 from datetime import UTC, datetime
+from importlib.resources import files
 from pathlib import Path
 
 from aloy.contracts import Message, Usage
@@ -20,67 +22,6 @@ def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
-MIGRATIONS = [
-    """
-    CREATE TABLE conversations (
-        id TEXT PRIMARY KEY, title TEXT NOT NULL, system_prompt TEXT NOT NULL,
-        created_at TEXT NOT NULL, updated_at TEXT NOT NULL
-    );
-    CREATE TABLE runs (
-        id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-        provider TEXT NOT NULL, model TEXT NOT NULL,
-        status TEXT NOT NULL CHECK(status IN ('running','completed','failed','cancelled','interrupted')),
-        started_at TEXT NOT NULL, ended_at TEXT, error TEXT,
-        input_tokens INTEGER, output_tokens INTEGER, estimated_usd REAL
-    );
-    CREATE TABLE messages (
-        id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-        run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
-        sequence INTEGER NOT NULL, role TEXT NOT NULL CHECK(role IN ('user','assistant')),
-        text TEXT NOT NULL, status TEXT NOT NULL CHECK(status IN ('complete','failed','cancelled')),
-        created_at TEXT NOT NULL, UNIQUE(conversation_id, sequence)
-    );
-    CREATE INDEX messages_order ON messages(conversation_id, sequence);
-    CREATE TABLE audio_assets (
-        id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-        message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
-        run_id TEXT REFERENCES runs(id) ON DELETE SET NULL,
-        path TEXT NOT NULL UNIQUE, format TEXT NOT NULL, duration_seconds REAL,
-        sha256 TEXT NOT NULL, direction TEXT NOT NULL CHECK(direction IN ('input','output')),
-        playback_status TEXT NOT NULL DEFAULT 'ready', created_at TEXT NOT NULL
-    );
-    CREATE TABLE provider_sessions (
-        conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
-        provider TEXT NOT NULL, session_id TEXT NOT NULL, synced_sequence INTEGER NOT NULL DEFAULT 0,
-        PRIMARY KEY(conversation_id, provider)
-    );
-    CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-    """,
-    """
-    ALTER TABLE audio_assets ADD COLUMN provider TEXT;
-    ALTER TABLE audio_assets ADD COLUMN estimated_usd REAL;
-    """,
-    """
-    CREATE TABLE spend_events (
-        source_type TEXT NOT NULL CHECK(source_type IN ('run','audio')),
-        source_id TEXT NOT NULL, amount_usd REAL NOT NULL CHECK(amount_usd >= 0),
-        created_at TEXT NOT NULL, PRIMARY KEY(source_type, source_id)
-    );
-    INSERT INTO spend_events
-        SELECT 'run', id, estimated_usd, started_at FROM runs
-        WHERE estimated_usd IS NOT NULL AND estimated_usd > 0;
-    INSERT INTO spend_events
-        SELECT 'audio', id, estimated_usd, created_at FROM audio_assets
-        WHERE estimated_usd IS NOT NULL AND estimated_usd > 0;
-    """,
-    """
-    ALTER TABLE provider_sessions ADD COLUMN updated_at TEXT;
-    UPDATE provider_sessions SET updated_at=strftime('%Y-%m-%dT%H:%M:%f+00:00','now')
-        WHERE updated_at IS NULL;
-    """,
-]
-
-
 class ConversationStore:
     def __init__(self, root: Path | None = None) -> None:
         self.root = root or data_root()
@@ -91,18 +32,143 @@ class ConversationStore:
         self.db.execute("PRAGMA foreign_keys=ON")
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY)")
-        for version, sql in enumerate(MIGRATIONS, 1):
+        for migration in sorted(
+            files("aloy").joinpath("migrations").iterdir(), key=lambda p: p.name
+        ):
+            version = int(migration.name.split(".")[0])
             if not self.db.execute(
                 "SELECT 1 FROM schema_migrations WHERE version=?", (version,)
             ).fetchone():
-                with self.db:
-                    for statement in sql.split(";"):
-                        if statement.strip():
+                with self.transaction():
+                    statement = ""
+                    for line in migration.read_text().splitlines(keepends=True):
+                        statement += line
+                        if sqlite3.complete_statement(statement):
                             self.db.execute(statement)
+                            statement = ""
                     self.db.execute("INSERT INTO schema_migrations VALUES(?)", (version,))
+
+    @contextmanager
+    def transaction(self):
+        # Savepoints also work inside another transaction and roll back DDL.
+        name = "tx_" + uuid.uuid4().hex
+        self.db.execute(f"SAVEPOINT {name}")
+        try:
+            yield
+        except BaseException:
+            self.db.execute(f"ROLLBACK TO {name}")
+            self.db.execute(f"RELEASE {name}")
+            raise
+        else:
+            self.db.execute(f"RELEASE {name}")
+
+    def recover(self) -> None:
+        """Only the exclusive desktop owner invokes crash recovery."""
+        with self.transaction():
+            self.db.execute(
+                "UPDATE runs SET status='interrupted', ended_at=? WHERE status='running'", (_now(),)
+            )
+            self.db.execute(
+                "UPDATE reservations SET status='settled',amount_usd=0 WHERE status='held'"
+            )
+            # Dispatched reservations remain charged: remote billing is uncertain.
+            self.db.execute("UPDATE reservations SET status='settled' WHERE status='dispatched'")
+            for asset in self.db.execute("SELECT id,path FROM audio_assets"):
+                if not Path(asset["path"]).exists():
+                    self.db.execute(
+                        "UPDATE audio_assets SET playback_status='missing' WHERE id=?",
+                        (asset["id"],),
+                    )
+        self.drain_deletions()
+        # Unreferenced audio/tmp files are retained, never silently deleted.
+
+    def reserve(self, amount: float, ceiling: float = 30.0) -> str:
+        if amount < 0:
+            raise ValueError("Negative reservation")
+        reservation_id = str(uuid.uuid4())
+        # Acquire the write lock before reading the ledger, across connections.
+        with self.transaction():
+            self.db.execute("UPDATE settings SET value=value WHERE key='budget_lock'")
+            if self.monthly_spend() + amount > ceiling:
+                raise RuntimeError("Aloy's monthly estimated spend limit has been reached")
+            self.db.execute(
+                "INSERT INTO reservations VALUES(?,?,?,?)", (reservation_id, amount, "held", _now())
+            )
+        return reservation_id
+
+    def mark_dispatched(self, reservation_id: str) -> None:
         self.db.execute(
-            "UPDATE runs SET status='interrupted', ended_at=? WHERE status='running'", (_now(),)
+            "UPDATE reservations SET status='dispatched' WHERE id=? AND status='held'",
+            (reservation_id,),
         )
+
+    def settle(self, reservation_id: str, actual: float | None = None) -> None:
+        row = self.db.execute("SELECT * FROM reservations WHERE id=?", (reservation_id,)).fetchone()
+        if not row or row["status"] == "settled":
+            return
+        amount = (
+            actual
+            if actual is not None
+            else (row["amount_usd"] if row["status"] == "dispatched" else 0.0)
+        )
+        self.db.execute(
+            "UPDATE reservations SET status='settled',amount_usd=? WHERE id=?",
+            (amount, reservation_id),
+        )
+
+    def record_client_metric(self, kind: str, value: float) -> None:
+        if kind != "playback_stop_ms" or not 0 <= value <= 60000:
+            raise ValueError("Unsupported client metric")
+        self.db.execute(
+            "INSERT INTO client_metrics(kind,value,created_at) VALUES(?,?,?)", (kind, value, _now())
+        )
+
+    def set_audio_duration(self, asset_id: str, seconds: float) -> None:
+        self.db.execute(
+            "UPDATE audio_assets SET duration_seconds=? WHERE id=?", (seconds, asset_id)
+        )
+
+    def mark_playback(self, asset_id: str, status: str) -> None:
+        if status not in {"playing", "played", "cancelled", "failed"}:
+            raise ValueError("Invalid playback state")
+        self.db.execute("UPDATE audio_assets SET playback_status=? WHERE id=?", (status, asset_id))
+
+    def message_id(self, run_id: str, role: str) -> str | None:
+        row = self.db.execute(
+            "SELECT id FROM messages WHERE run_id=? AND role=? ORDER BY sequence DESC LIMIT 1",
+            (run_id, role),
+        ).fetchone()
+        return row[0] if row else None
+
+    def audio_asset(self, asset_id: str) -> dict:
+        row = self.db.execute("SELECT * FROM audio_assets WHERE id=?", (asset_id,)).fetchone()
+        if row is None:
+            raise KeyError(asset_id)
+        return dict(row)
+
+    def link_audio(self, asset_id: str, run_id: str, role: str) -> None:
+        self.db.execute(
+            "UPDATE audio_assets SET run_id=?,message_id=? WHERE id=? AND conversation_id=(SELECT conversation_id FROM runs WHERE id=?)",
+            (run_id, self.message_id(run_id, role), asset_id, run_id),
+        )
+
+    def attach_run_audio(self, run_id: str) -> None:
+        for role, direction in (("user", "input"), ("assistant", "output")):
+            self.db.execute(
+                "UPDATE audio_assets SET message_id=? WHERE run_id=? AND direction=?",
+                (self.message_id(run_id, role), run_id, direction),
+            )
+
+    def drain_deletions(self) -> None:
+        for row in self.db.execute("SELECT path FROM pending_deletions").fetchall():
+            path = Path(row[0])
+            if not path.resolve().is_relative_to((self.root / "audio").resolve()):
+                continue
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                continue
+            self.db.execute("DELETE FROM pending_deletions WHERE path=?", (str(path),))
 
     def close(self) -> None:
         self.db.close()
@@ -149,7 +215,7 @@ class ConversationStore:
 
     def begin_run(self, conversation_id: str, provider: str, model: str, user_text: str) -> str:
         run_id = str(uuid.uuid4())
-        with self.db:
+        with self.transaction():
             self.db.execute(
                 "INSERT INTO runs(id,conversation_id,provider,model,status,started_at) VALUES(?,?,?,?,?,?)",
                 (run_id, conversation_id, provider, model, "running", _now()),
@@ -162,8 +228,13 @@ class ConversationStore:
             )
         return run_id
 
+    def exclude_run_input(self, run_id: str, status: str = "cancelled") -> None:
+        self.db.execute(
+            "UPDATE messages SET status=? WHERE run_id=? AND role='user'", (status, run_id)
+        )
+
     def update_user_text(self, run_id: str, text: str) -> None:
-        with self.db:
+        with self.transaction():
             self.db.execute(
                 "UPDATE messages SET text=? WHERE run_id=? AND role='user'",
                 (text, run_id),
@@ -197,13 +268,20 @@ class ConversationStore:
         return message_id
 
     def finish_run(
-        self, run_id: str, status: str, text: str = "", usage: Usage | None = None, error: str = ""
+        self,
+        run_id: str,
+        status: str,
+        text: str = "",
+        usage: Usage | None = None,
+        error: str = "",
+        *,
+        accounted: bool = False,
     ) -> None:
         row = self.db.execute("SELECT conversation_id FROM runs WHERE id=?", (run_id,)).fetchone()
         if row is None:
             raise KeyError(run_id)
         usage = usage or Usage()
-        with self.db:
+        with self.transaction():
             self.db.execute(
                 "UPDATE runs SET status=?, ended_at=?, error=?, input_tokens=?, output_tokens=?, "
                 "estimated_usd=? WHERE id=?",
@@ -217,7 +295,7 @@ class ConversationStore:
                     run_id,
                 ),
             )
-            if usage.estimated_usd is not None and usage.estimated_usd > 0:
+            if not accounted and usage.estimated_usd is not None and usage.estimated_usd > 0:
                 self.db.execute(
                     "INSERT INTO spend_events VALUES('run',?,?,?) "
                     "ON CONFLICT(source_type,source_id) DO UPDATE SET amount_usd=excluded.amount_usd",
@@ -229,7 +307,11 @@ class ConversationStore:
                     run_id,
                     "assistant",
                     text,
-                    "complete" if status == "completed" else "failed",
+                    "complete"
+                    if status == "completed"
+                    else "cancelled"
+                    if status == "cancelled"
+                    else "failed",
                 )
             self.db.execute(
                 "UPDATE conversations SET updated_at=? WHERE id=?", (_now(), row["conversation_id"])
@@ -247,7 +329,11 @@ class ConversationStore:
             "SELECT COALESCE(SUM(amount_usd),0) FROM spend_events WHERE created_at LIKE ?",
             (month + "%",),
         ).fetchone()[0]
-        return float(amount)
+        reserved = self.db.execute(
+            "SELECT COALESCE(SUM(amount_usd),0) FROM reservations WHERE status!='settled' OR created_at LIKE ?",
+            (month + "%",),
+        ).fetchone()[0]
+        return float(amount + reserved)
 
     def save_audio(
         self,
@@ -261,6 +347,7 @@ class ConversationStore:
         duration_seconds: float | None = None,
         provider: str | None = None,
         estimated_usd: float | None = None,
+        accounted: bool = False,
     ) -> dict:
         self.conversation(conversation_id)
         if direction not in ("input", "output") or extension not in ("wav", "m4a"):
@@ -278,7 +365,7 @@ class ConversationStore:
                 file.flush()
                 os.fsync(file.fileno())
             temporary.replace(path)
-            with self.db:
+            with self.transaction():
                 self.db.execute(
                     "INSERT INTO audio_assets(id,conversation_id,message_id,run_id,path,format,"
                     "duration_seconds,sha256,direction,playback_status,created_at,provider,estimated_usd) "
@@ -299,7 +386,7 @@ class ConversationStore:
                         estimated_usd,
                     ),
                 )
-                if estimated_usd is not None and estimated_usd > 0:
+                if not accounted and estimated_usd is not None and estimated_usd > 0:
                     self.db.execute(
                         "INSERT INTO spend_events VALUES('audio',?,?,?)",
                         (asset_id, estimated_usd, _now()),
@@ -319,6 +406,16 @@ class ConversationStore:
             )
         ]
 
+    def orphan_audio(self) -> list[Path]:
+        known = {row[0] for row in self.db.execute("SELECT path FROM audio_assets")}
+        return [
+            path
+            for folder in (self.root / "audio", self.root / "tmp")
+            if folder.exists()
+            for path in folder.rglob("*")
+            if path.is_file() and str(path) not in known
+        ]
+
     def storage_bytes(self) -> int:
         return sum(
             path.lstat().st_size
@@ -329,9 +426,16 @@ class ConversationStore:
     def delete_conversation(self, conversation_id: str) -> None:
         self.conversation(conversation_id)
         paths = [Path(row["path"]) for row in self.audio_assets(conversation_id)]
-        self.db.execute("DELETE FROM conversations WHERE id=?", (conversation_id,))
-        for path in paths:
-            path.unlink(missing_ok=True)
+        folder = self.root / "audio" / conversation_id
+        if folder.exists():
+            paths.extend(path for path in folder.iterdir() if path.is_file())
+        with self.transaction():
+            self.db.executemany(
+                "INSERT OR IGNORE INTO pending_deletions VALUES(?)",
+                [(str(path),) for path in paths],
+            )
+            self.db.execute("DELETE FROM conversations WHERE id=?", (conversation_id,))
+        self.drain_deletions()
         folder = self.root / "audio" / conversation_id
         if folder.exists() and not any(folder.iterdir()):
             folder.rmdir()

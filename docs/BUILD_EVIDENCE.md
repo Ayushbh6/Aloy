@@ -1,5 +1,8 @@
 # First-build evidence — 2026-09-24
 
+Historical initial-build measurements. The later [repair review](REPAIR_REVIEW.md)
+supersedes the implementation status, test coverage and open microphone check below.
+
 This is a bounded synthetic check on a local Apple Silicon Mac. It does not measure human speech accuracy or establish exam-teaching quality. No private learner recording was used.
 
 ## Runtime and providers

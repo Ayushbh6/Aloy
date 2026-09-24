@@ -5,7 +5,7 @@ import AVFoundation
 final class OrbView: NSView {
     var onClick: (() -> Void)?
     var isSpeaking = false { didSet { needsDisplay = true } }
-    private var down: NSPoint?
+    private var gesture = OrbGesture()
     override var isOpaque: Bool { false }
     override func draw(_ dirtyRect: NSRect) {
         let outer = bounds.insetBy(dx: 2, dy: 2)
@@ -17,21 +17,18 @@ final class OrbView: NSView {
         NSColor.white.withAlphaComponent(0.9).setFill()
         NSBezierPath(ovalIn: NSRect(x: bounds.midX - 4, y: bounds.midY - 4, width: 8, height: 8)).fill()
     }
-    override func mouseDown(with event: NSEvent) { down = event.locationInWindow }
+    override func mouseDown(with event: NSEvent) {
+        gesture.begin(at: window?.convertPoint(toScreen: event.locationInWindow) ?? NSEvent.mouseLocation, windowOrigin: window?.frame.origin ?? .zero)
+    }
     override func mouseDragged(with event: NSEvent) {
-        guard let previous = down, let window else { return }
-        let current = event.locationInWindow
-        window.setFrameOrigin(NSPoint(x: window.frame.origin.x + current.x - previous.x,
-                                      y: window.frame.origin.y + current.y - previous.y))
+        gesture.markDragged()
+        let point = window?.convertPoint(toScreen: event.locationInWindow) ?? NSEvent.mouseLocation
+        if let origin = gesture.move(to: point) { window?.setFrameOrigin(origin) }
     }
     override func mouseUp(with event: NSEvent) {
-        if let previous = down {
-            let dx = event.locationInWindow.x - previous.x
-            let dy = event.locationInWindow.y - previous.y
-            if abs(dx) + abs(dy) < 5 { onClick?() }
-        }
-        down = nil
+        if gesture.end(at: window?.convertPoint(toScreen: event.locationInWindow) ?? NSEvent.mouseLocation) { onClick?() }
     }
+
 }
 
 final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDelegate,
@@ -45,6 +42,7 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
     private var entry: NSTextField!
     private var status: NSTextField!
     private var recordButton: NSButton!
+    private var stopButton: NSButton!
     private var historyPicker: NSPopUpButton!
     private var providerPicker: NSPopUpButton!
     private var speechPicker: NSPopUpButton!
@@ -55,7 +53,12 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
     private var recordedPath: String?
     private var microphoneRequestPending = false
     private var player: AVAudioPlayer?
-    private var audioQueue: [String] = []
+    private var audioQueue: [(path: String, id: String)] = []
+    private var inputReplay: (path: String, id: String)?
+    private var replayAssets: [(path: String, id: String)] = []
+    private var playingAssetID: String?
+    private var lastAudioAssetID: String?
+    private var operation = OperationGate()
     private var replyBuffer = ""
     private var lastAudioPath: String?
     private var currentRunID: String?
@@ -69,7 +72,7 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
 
     func applicationWillTerminate(_ notification: Notification) {
         recorder?.stop()
-        if let recordedPath { try? FileManager.default.removeItem(atPath: recordedPath) }
+        // Unfinished capture remains in Aloy/tmp for recovery on next launch.
         player?.stop()
         backend?.terminate()
     }
@@ -132,7 +135,7 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
         canvas.addSubview(button("New", frame: NSRect(x: 290, y: 421, width: 82, height: 28),
                                  action: #selector(newConversation)))
 
-        let scroll = NSScrollView(frame: NSRect(x: 20, y: 154, width: 352, height: 255))
+        let scroll = NSScrollView(frame: NSRect(x: 20, y: 188, width: 352, height: 221))
         scroll.hasVerticalScroller = true
         scroll.borderType = .noBorder
         transcript = NSTextView(frame: scroll.bounds)
@@ -144,22 +147,30 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
         scroll.documentView = transcript
         canvas.addSubview(scroll)
 
-        entry = NSTextField(frame: NSRect(x: 20, y: 115, width: 270, height: 29))
+        entry = NSTextField(frame: NSRect(x: 20, y: 147, width: 270, height: 29))
         entry.placeholderString = "Talk to Aloy…"
         entry.delegate = self
         canvas.addSubview(entry)
-        canvas.addSubview(button("Send", frame: NSRect(x: 299, y: 115, width: 73, height: 29),
+        canvas.addSubview(button("Send", frame: NSRect(x: 299, y: 147, width: 73, height: 29),
                                  action: #selector(sendText)))
-        recordButton = button("Record", frame: NSRect(x: 20, y: 77, width: 75, height: 29),
+        recordButton = button("Record", frame: NSRect(x: 20, y: 109, width: 166, height: 29),
                               action: #selector(toggleRecording))
         canvas.addSubview(recordButton)
-        canvas.addSubview(button("Stop", frame: NSRect(x: 99, y: 77, width: 58, height: 29),
-                                 action: #selector(stopAction)))
-        canvas.addSubview(button("Replay", frame: NSRect(x: 161, y: 77, width: 65, height: 29),
-                                 action: #selector(replayAudio)))
-        canvas.addSubview(button("Storage", frame: NSRect(x: 230, y: 77, width: 70, height: 29),
+        stopButton = button("Stop", frame: NSRect(x: 195, y: 109, width: 177, height: 29),
+                            action: #selector(stopAction))
+        canvas.addSubview(stopButton)
+        let replayButton = button("Replay", frame: NSRect(x: 20, y: 73, width: 108, height: 29),
+                                  action: #selector(replayAudio))
+        replayButton.toolTip = "Replay the last reply. Right-click to replay your last recording."
+        let replayMenu = NSMenu()
+        let replayInput = NSMenuItem(title: "Replay last recording", action: #selector(replayInputAudio), keyEquivalent: "")
+        replayInput.target = self
+        replayMenu.addItem(replayInput)
+        replayButton.menu = replayMenu
+        canvas.addSubview(replayButton)
+        canvas.addSubview(button("Storage", frame: NSRect(x: 142, y: 73, width: 108, height: 29),
                                  action: #selector(showStorage)))
-        canvas.addSubview(button("Delete", frame: NSRect(x: 304, y: 77, width: 68, height: 29),
+        canvas.addSubview(button("Delete", frame: NSRect(x: 264, y: 73, width: 108, height: 29),
                                  action: #selector(deleteConversation)))
 
         providerPicker = NSPopUpButton(frame: NSRect(x: 20, y: 24, width: 122, height: 28))
@@ -207,7 +218,12 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
         let input = Pipe(), output = Pipe()
         process.standardInput = input
         process.standardOutput = output
-        process.standardError = Pipe()
+        let errors = Pipe()
+        process.standardError = errors
+        // Drain stderr so dependency diagnostics cannot block the subprocess.
+        errors.fileHandleForReading.readabilityHandler = { handle in
+            if handle.availableData.isEmpty { handle.readabilityHandler = nil }
+        }
         do { try process.run() } catch {
             status.stringValue = "Backend failed to start: \(error.localizedDescription)"
             return
@@ -235,6 +251,7 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
     private func command(_ action: String, _ fields: [String: Any] = [:]) {
         var object = fields
         object["v"] = 1
+        object["operation_id"] = operation.id
         object["action"] = action
         object["id"] = UUID().uuidString
         guard let data = try? JSONSerialization.data(withJSONObject: object),
@@ -249,6 +266,7 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
 
     private func handle(_ object: [String: Any]) {
         guard let event = object["event"] as? String else { return }
+        if let id = object["operation_id"] as? String, !operation.accepts(id) { return }
         switch event {
         case "ready":
             dataRoot = object["root"] as? String
@@ -289,12 +307,28 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
             lastAudioPath = (object["audio"] as? [[String: Any]])?.last(where: {
                 $0["direction"] as? String == "output"
             })?["path"] as? String
+            if let input = (object["audio"] as? [[String: Any]])?.last(where: { $0["direction"] as? String == "input" }),
+               let path = input["path"] as? String, let id = input["id"] as? String {
+                inputReplay = (path, id)
+            } else { inputReplay = nil }
+            let outputAssets = (object["audio"] as? [[String: Any]] ?? []).filter { $0["direction"] as? String == "output" }
+            let latestRun = outputAssets.last?["run_id"] as? String
+            replayAssets = outputAssets.filter { $0["run_id"] as? String == latestRun }.compactMap {
+                guard let path = $0["path"] as? String, let id = $0["id"] as? String else { return nil }
+                return (path, id)
+            }
+            lastAudioAssetID = (object["audio"] as? [[String: Any]])?.last(where: {
+                $0["direction"] as? String == "output"
+            })?["id"] as? String
             for item in object["messages"] as? [[String: Any]] ?? [] {
                 let role = item["role"] as? String == "user" ? "You" : "Aloy"
                 let body = item["text"] as? String ?? ""
-                append("\(role): \(body)\n\n")
+                let completion = item["status"] as? String ?? "complete"
+                let marker = completion == "complete" ? "" : " [\(completion)]"
+                append("\(role)\(marker): \(body)\n\n")
             }
         case "started":
+            replayAssets.removeAll()
             currentRunID = object["run_id"] as? String
             replyBuffer = ""
             status.stringValue = "Thinking…"
@@ -314,9 +348,11 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
             append("You: \(object["text"] as? String ?? "")\n\n")
             status.stringValue = "Thinking…"
         case "audio":
-            if let path = object["path"] as? String {
+            if let path = object["path"] as? String, let id = object["asset_id"] as? String {
                 lastAudioPath = path
-                audioQueue.append(path)
+                lastAudioAssetID = id
+                replayAssets.append((path, id))
+                audioQueue.append((path, id))
                 playNext()
             }
         case "turn_done":
@@ -324,6 +360,9 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
                 status.stringValue = "Ready"
             }
             command("list")
+        case "recording_retained":
+            status.stringValue = "Saved locally. Right-click Replay to hear it. Not sent."
+            if let id = conversationID { command("select", ["conversation_id": id]) }
         case "storage":
             let bytes = object["bytes"] as? Int ?? 0
             let spend = object["spend_usd"] as? Double ?? 0
@@ -331,10 +370,13 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
             alert.messageText = "Aloy storage"
             alert.informativeText = String(format: "%.1f MB locally · $%.4f estimated this month",
                                            Double(bytes) / 1_000_000, spend)
+            let orphans = object["retained_orphans"] as? Int ?? 0
+            if orphans > 0 { alert.informativeText += " · \(orphans) recovered files retained" }
             alert.runModal()
         case "deleted":
             command("list")
         case "error", "speech_error":
+            stopPlayback()
             status.stringValue = object["error"] as? String ?? "Error"
         case "stopped":
             if recorder == nil { status.stringValue = "Ready" }
@@ -344,20 +386,28 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
 
     private func playNext() {
         guard player?.isPlaying != true, !audioQueue.isEmpty else { return }
-        let path = audioQueue.removeFirst()
+        let asset = audioQueue.removeFirst()
+        playingAssetID = asset.id
         do {
-            player = try AVAudioPlayer(contentsOf: URL(fileURLWithPath: path))
+            player = try AVAudioPlayer(contentsOf: URL(fileURLWithPath: asset.path))
             player?.delegate = self
             guard player?.play() == true else {
                 player = nil
+                command("playback", ["asset_id": asset.id, "status": "failed"])
                 status.stringValue = "Audio playback could not start"
                 return
             }
+            command("playback", ["asset_id": asset.id, "status": "playing"])
             orb.isSpeaking = true
             status.stringValue = "Speaking…"
-        } catch { status.stringValue = "Audio playback failed" }
+        } catch {
+            command("playback", ["asset_id": asset.id, "status": "failed"])
+            status.stringValue = "Audio playback failed"
+        }
     }
     func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
+        if let id = playingAssetID { command("playback", ["asset_id": id, "status": flag ? "played" : "failed"]) }
+        playingAssetID = nil
         self.player = nil
         orb.isSpeaking = false
         if !flag { status.stringValue = "Audio playback stopped unexpectedly" }
@@ -366,10 +416,18 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
     }
 
     private func stopPlayback() {
+        let began = ProcessInfo.processInfo.systemUptime
+        let wasPlaying = player?.isPlaying == true
         player?.stop()
         player = nil
+        let cancelled = audioQueue
         audioQueue.removeAll()
         orb.isSpeaking = false
+        let elapsed = (ProcessInfo.processInfo.systemUptime - began) * 1000
+        if let id = playingAssetID { command("playback", ["asset_id": id, "status": "cancelled"]) }
+        playingAssetID = nil
+        for asset in cancelled { command("playback", ["asset_id": asset.id, "status": "cancelled"]) }
+        if wasPlaying { command("metric", ["kind": "playback_stop_ms", "value": elapsed]) }
     }
 
     private var provider: String {
@@ -382,6 +440,7 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
     }
 
     @objc private func settingsChanged() {
+        stopAction()
         command("set_setting", ["key": "provider", "value": provider])
         command("set_setting", ["key": "speech", "value": speech ?? "none"])
         command("set_setting", ["key": "mode",
@@ -394,6 +453,7 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
             status.stringValue = "Live audio uses Record"
             return
         }
+        operation.invalidate()
         let text = entry.stringValue
         entry.stringValue = ""
         stopPlayback()
@@ -403,18 +463,7 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
     }
 
     @objc private func toggleRecording() {
-        if let recorder {
-            recorder.stop()
-            self.recorder = nil
-            recordButton.title = "Record"
-            guard let id = conversationID, let path = recordedPath else { return }
-            recordedPath = nil
-            command("recorded", ["conversation_id": id, "path": path,
-                                 "provider": provider, "speech": speech as Any? ?? NSNull(),
-                                 "mode": modePicker.indexOfSelectedItem == 1 ? "live" : "standard"])
-            status.stringValue = "Transcribing…"
-            return
-        }
+        if recorder != nil { finishRecording(); return }
         guard dataRoot != nil, conversationID != nil, !microphoneRequestPending else { return }
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
         case .authorized:
@@ -439,8 +488,29 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
         }
     }
 
+    private func finishRecording() {
+        let previous = recorder
+        recorder = nil
+        previous?.stop()
+        recordButton.title = "Record"
+        stopButton.title = "Stop"
+        guard let id = conversationID, let path = recordedPath else { return }
+        recordedPath = nil
+        command("recorded", ["conversation_id": id, "path": path,
+                             "provider": provider, "speech": speech as Any? ?? NSNull(),
+                             "mode": modePicker.indexOfSelectedItem == 1 ? "live" : "standard"])
+        status.stringValue = "Processing recording…"
+    }
+
+    func audioRecorderDidFinishRecording(_ recorder: AVAudioRecorder, successfully flag: Bool) {
+        guard self.recorder === recorder else { return }
+        if flag { finishRecording() }
+        else { stopAction(); status.stringValue = "Recording failed" }
+    }
+
     private func startRecording() {
         guard let root = dataRoot, conversationID != nil else { return }
+        operation.invalidate()
         stopPlayback()
         command("stop")
         let folder = URL(fileURLWithPath: root).appendingPathComponent("tmp")
@@ -460,8 +530,9 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
             candidate.delegate = self
             recorder = candidate
             recordedPath = url.path
-            recordButton.title = "Finish"
-            status.stringValue = "Recording… click Finish"
+            recordButton.title = "Finish & Send"
+            status.stringValue = "Recording… Finish & Send, or Cancel recording"
+            stopButton.title = "Cancel recording"
         } catch {
             try? FileManager.default.removeItem(at: url)
             status.stringValue = "Microphone unavailable"
@@ -469,37 +540,51 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
     }
 
     @objc private func stopAction() {
+        operation.invalidate()
+        currentRunID = nil
         microphoneRequestPending = false
         recordButton.isEnabled = true
-        recorder?.stop()
+        let duration = recorder?.currentTime ?? 0
+        let previousRecorder = recorder
         recorder = nil
-        if let path = recordedPath { try? FileManager.default.removeItem(atPath: path) }
+        previousRecorder?.stop()
+        let cancelledPath = recordedPath
         recordedPath = nil
         recordButton.title = "Record"
+        stopButton.title = "Stop"
         stopPlayback()
         command("stop")
         status.stringValue = "Stopped"
+        if let path = cancelledPath, let id = conversationID {
+            command("cancel_recording", ["conversation_id": id, "path": path, "duration": duration])
+        }
     }
 
     @objc private func newConversation() {
-        stopPlayback()
-        command("stop")
+        stopAction()
         command("new")
     }
     @objc private func selectConversation() {
         if let id = historyPicker.selectedItem?.representedObject as? String {
-            stopPlayback()
-            command("stop")
+            stopAction()
             command("select", ["conversation_id": id])
         }
     }
     @objc private func showStorage() { command("storage") }
     @objc private func replayAudio() {
-        guard let path = lastAudioPath else { status.stringValue = "No audio to replay"; return }
+        guard !replayAssets.isEmpty else { status.stringValue = "No audio to replay"; return }
         stopPlayback()
-        audioQueue.append(path)
+        audioQueue = replayAssets
         playNext()
     }
+
+    @objc private func replayInputAudio() {
+        guard let input = inputReplay else { status.stringValue = "No input recording"; return }
+        stopPlayback()
+        audioQueue = [input]
+        playNext()
+    }
+
     @objc private func deleteConversation() {
         guard let id = conversationID else { return }
         let alert = NSAlert()
@@ -507,8 +592,7 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
         alert.addButton(withTitle: "Delete")
         alert.addButton(withTitle: "Cancel")
         if alert.runModal() == .alertFirstButtonReturn {
-            stopPlayback()
-            command("stop")
+            stopAction()
             command("delete", ["conversation_id": id])
             conversationID = nil
             transcript.string = ""
@@ -520,7 +604,13 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
     }
 }
 
-let app = NSApplication.shared
-let controller = AppController()
-app.delegate = controller
-app.run()
+@main
+struct AloyMain {
+    static func main() {
+        let app = NSApplication.shared
+        let controller = AppController()
+        app.delegate = controller
+        app.run()
+        withExtendedLifetime(controller) {}
+    }
+}

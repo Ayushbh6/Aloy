@@ -6,6 +6,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from aloy.contracts import AgentConfig, ContextOverflowError, Message, ProviderEvent, Usage
+from aloy.dispatch import DispatchBudget, gemini_client
 from aloy.storage import ConversationStore, data_root
 
 MODEL_PRESETS = {
@@ -33,7 +34,10 @@ def load_local_env(path: Path | None = None) -> None:
 
 
 class OpenRouterProvider:
-    def __init__(self, api_key: str | None = None) -> None:
+    def __init__(
+        self, api_key: str | None = None, *, dispatch: DispatchBudget | None = None
+    ) -> None:
+        self.dispatch = dispatch or DispatchBudget()
         from openai import AsyncOpenAI
 
         api_key = api_key or os.environ.get("OPENROUTER_API_KEY")
@@ -42,6 +46,14 @@ class OpenRouterProvider:
         self.client = AsyncOpenAI(
             api_key=api_key, base_url="https://openrouter.ai/api/v1", max_retries=0
         )
+
+    async def close(self):
+        await self.client.close()
+
+    async def preflight(self, model: str):
+        catalog = await self.client.models.list()
+        if model not in {item.id for item in catalog.data}:
+            raise ValueError(f"OpenRouter model unavailable: {model}")
 
     async def stream(
         self,
@@ -54,6 +66,8 @@ class OpenRouterProvider:
         payload = [{"role": "system", "content": system_prompt}]
         payload.extend({"role": item.role, "content": item.text} for item in messages)
         try:
+            completed = False
+            self.dispatch.consume()
             stream = await self.client.chat.completions.create(
                 model=config.model,
                 messages=payload,
@@ -67,6 +81,13 @@ class OpenRouterProvider:
             )
             async for chunk in stream:
                 if chunk.choices:
+                    reason = chunk.choices[0].finish_reason
+                    if reason == "stop":
+                        completed = True
+                    elif reason is not None:
+                        raise RuntimeError(
+                            f"OpenRouter ended without a complete text answer: {reason}"
+                        )
                     delta = chunk.choices[0].delta.content
                     if delta:
                         yield ProviderEvent("delta", delta)
@@ -75,6 +96,8 @@ class OpenRouterProvider:
                         "usage",
                         usage=Usage(chunk.usage.prompt_tokens, chunk.usage.completion_tokens),
                     )
+            if not completed:
+                raise RuntimeError("OpenRouter stream ended without completion")
         except Exception as exc:
             if "context" in str(exc).lower() and (
                 "length" in str(exc).lower() or "window" in str(exc).lower()
@@ -91,14 +114,27 @@ class OpenRouterProvider:
 
 
 class GeminiProvider:
-    def __init__(self, store: ConversationStore, api_key: str | None = None) -> None:
-        from google import genai
+    def __init__(
+        self,
+        store: ConversationStore,
+        api_key: str | None = None,
+        *,
+        dispatch: DispatchBudget | None = None,
+    ) -> None:
+        self.dispatch = dispatch or DispatchBudget()
 
         api_key = api_key or os.environ.get("GEMINI_API_KEY")
         if not api_key:
             raise ValueError("GEMINI_API_KEY is missing")
-        self.client = genai.Client(api_key=api_key)
+        self.client = gemini_client(api_key)
         self.store = store
+
+    async def close(self):
+        await self.client.aio.aclose()
+        self.client.close()
+
+    async def preflight(self, model: str):
+        await self.client.aio.models.get(model=model)
 
     async def stream(
         self,
@@ -128,6 +164,7 @@ class GeminiProvider:
             ]
             previous_id = None
         try:
+            self.dispatch.consume()
             stream = await self.client.aio.interactions.create(
                 model=config.model,
                 input=request_input,
@@ -169,13 +206,15 @@ class GeminiProvider:
             raise
 
 
-def make_provider(provider: str, store: ConversationStore | None = None):
+def make_provider(
+    provider: str, store: ConversationStore | None = None, *, dispatch: DispatchBudget | None = None
+):
     if provider == "openrouter":
-        return OpenRouterProvider()
+        return OpenRouterProvider(dispatch=dispatch)
     if provider in ("gemini", "gemini-quality"):
         if store is None:
             raise ValueError("Gemini provider requires a conversation store")
-        return GeminiProvider(store)
+        return GeminiProvider(store, dispatch=dispatch)
     if provider == "fake":
         from aloy.agent import FakeProvider
 

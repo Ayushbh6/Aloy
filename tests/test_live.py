@@ -40,7 +40,7 @@ def test_live_recording_bypasses_stt_and_preserves_cross_mode_history(tmp_path, 
         monkeypatch.setattr("aloy.bridge.to_16k_wav", lambda _: wav_bytes())
 
         class FakeLive:
-            async def exchange(self, history, wav):
+            async def exchange(self, history, wav, **kwargs):
                 assert [(item.role, item.text) for item in history] == [
                     ("user", "Hallo"),
                     ("assistant", "Guten Tag"),

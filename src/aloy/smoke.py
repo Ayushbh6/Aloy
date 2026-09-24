@@ -4,9 +4,9 @@ import argparse
 import asyncio
 import json
 import time
-from pathlib import Path
 
 from aloy import AgentConfig, ChatAgent, ConversationStore
+from aloy.dispatch import DispatchBudget
 from aloy.providers import MODEL_PRESETS, load_local_env, make_provider
 
 
@@ -14,7 +14,7 @@ async def _run(provider_name: str) -> dict:
     load_local_env()
     if provider_name not in MODEL_PRESETS:
         raise ValueError(f"Unknown provider: {provider_name}")
-    store = ConversationStore(Path.cwd() / ".local" / "smoke-data")
+    store = ConversationStore()
     config = AgentConfig(
         provider=provider_name,
         model=MODEL_PRESETS[provider_name],
@@ -24,8 +24,11 @@ async def _run(provider_name: str) -> dict:
     )
     conversation_id = store.create_conversation(config.system_prompt, "Synthetic smoke check")
     start = time.monotonic()
+    dispatch = DispatchBudget(limit=1)
+    provider = None
     try:
-        reply = await ChatAgent(config, store, make_provider(provider_name, store)).reply(
+        provider = make_provider(provider_name, store, dispatch=dispatch)
+        reply = await ChatAgent(config, store, provider).reply(
             conversation_id, "Say hello in German in one short sentence."
         )
         evidence = {
@@ -33,7 +36,7 @@ async def _run(provider_name: str) -> dict:
             "model": config.model,
             "result": "passed" if reply.text.strip() else "failed",
             "elapsed_seconds": round(time.monotonic() - start, 2),
-            "dispatches": 1 if provider_name != "codex" else "provider-managed turn",
+            "dispatches": dispatch.count if provider_name != "codex" else "provider-managed turn",
             "input_tokens": reply.usage.input_tokens,
             "output_tokens": reply.usage.output_tokens,
             "estimated_usd": reply.usage.estimated_usd,
@@ -45,8 +48,12 @@ async def _run(provider_name: str) -> dict:
             "result": "failed",
             "elapsed_seconds": round(time.monotonic() - start, 2),
             "error_type": type(exc).__name__,
+            "dispatches": dispatch.count,
         }
     finally:
+        if provider and hasattr(provider, "close"):
+            await provider.close()
+        store.delete_conversation(conversation_id)
         store.close()
     return evidence
 

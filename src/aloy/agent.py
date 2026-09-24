@@ -3,7 +3,7 @@
 import asyncio
 from collections.abc import AsyncIterator
 
-from aloy.budget import MONTHLY_LIMIT_USD, estimated_cost, maximum_reservation
+from aloy.budget import estimated_cost, maximum_reservation
 from aloy.contracts import (
     AgentConfig,
     AgentEvent,
@@ -14,6 +14,8 @@ from aloy.contracts import (
     TextProvider,
     Usage,
 )
+from aloy.errors import safe_error
+from aloy.lifecycle import RunLifecycle
 from aloy.storage import ConversationStore
 
 
@@ -49,62 +51,60 @@ class ChatAgent:
             if conversation["system_prompt"] != self.config.system_prompt:
                 raise ValueError("Conversation system prompt differs from this agent")
             history = self.store.completed_history(conversation_id)
-            if (
-                self.store.monthly_spend() + maximum_reservation(self.config, history, text)
-                > MONTHLY_LIMIT_USD
-            ):
-                raise RuntimeError("Aloy's monthly estimated spend limit has been reached")
-            run_id = self.store.begin_run(
-                conversation_id, self.config.provider, self.config.model, text
-            )
-            pieces: list[str] = []
-            usage = Usage()
-            session_id: str | None = None
+            run_id = ""
             try:
-                yield AgentEvent("started", conversation_id, run_id)
-                async with asyncio.timeout(self.config.timeout_seconds):
-                    async for event in self.provider.stream(
-                        conversation_id=conversation_id,
-                        system_prompt=self.config.system_prompt,
-                        messages=[*history, Message("user", text)],
-                        config=self.config,
-                    ):
-                        if event.kind == "delta":
-                            pieces.append(event.text)
-                            yield AgentEvent("delta", conversation_id, run_id, text=event.text)
-                        elif event.kind == "usage":
-                            usage = event.usage
-                        elif event.kind == "session":
-                            session_id = event.text
-                answer = "".join(pieces).strip()
-                if not answer:
-                    raise RuntimeError("Provider returned an empty response")
-                usage = Usage(
-                    usage.input_tokens,
-                    usage.output_tokens,
-                    estimated_cost(self.config.model, usage),
-                )
-                self.store.finish_run(run_id, "completed", answer, usage)
-                if session_id:
-                    self.store.set_session(
-                        conversation_id,
-                        f"{self.config.provider}:{self.config.model}",
-                        session_id,
-                        len(history) + 2,
+                with RunLifecycle(
+                    self.store,
+                    conversation_id,
+                    self.config.provider,
+                    self.config.model,
+                    text,
+                    maximum_reservation(self.config, history, text),
+                ) as run:
+                    run_id = run.run_id
+                    yield AgentEvent("started", conversation_id, run_id)
+                    session_id = None
+                    async with asyncio.timeout(self.config.timeout_seconds):
+                        if hasattr(self.provider, "preflight"):
+                            await self.provider.preflight(self.config.model)
+                        run.dispatched()
+                        async for event in self.provider.stream(
+                            conversation_id=conversation_id,
+                            system_prompt=self.config.system_prompt,
+                            messages=[*history, Message("user", text)],
+                            config=self.config,
+                        ):
+                            if event.kind == "delta":
+                                run.partial += event.text
+                                yield AgentEvent("delta", conversation_id, run_id, text=event.text)
+                            elif event.kind == "usage":
+                                run.usage = event.usage
+                            elif event.kind == "session":
+                                session_id = event.text
+                    answer = run.partial.strip()
+                    if not answer:
+                        raise RuntimeError("Provider returned an empty response")
+                    usage = Usage(
+                        run.usage.input_tokens,
+                        run.usage.output_tokens,
+                        estimated_cost(self.config.model, run.usage),
                     )
-                yield AgentEvent("completed", conversation_id, run_id, text=answer, usage=usage)
+                    run.complete(answer, usage)
+                    if session_id:
+                        self.store.set_session(
+                            conversation_id,
+                            f"{self.config.provider}:{self.config.model}",
+                            session_id,
+                            len(history) + 2,
+                        )
+                    yield AgentEvent("completed", conversation_id, run_id, text=answer, usage=usage)
             except asyncio.CancelledError:
-                self.store.finish_run(run_id, "cancelled", "".join(pieces), usage)
                 raise
             except Exception as exc:
-                message = str(exc)
+                message = safe_error(exc, 500)
                 if isinstance(exc, ContextOverflowError):
                     message = "Conversation context is full. Start a new conversation."
-                self.store.finish_run(run_id, "failed", "".join(pieces), usage, message)
                 yield AgentEvent("failed", conversation_id, run_id, error=message)
-            finally:
-                if self.store.run(run_id)["status"] == "running":
-                    self.store.finish_run(run_id, "cancelled", "".join(pieces), usage)
 
 
 class FakeProvider:
