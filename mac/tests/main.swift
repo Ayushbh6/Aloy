@@ -19,3 +19,13 @@ gate.invalidate()
 assert(!gate.accepts(old))
 assert(gate.accepts(gate.id))
 print("Native interaction checks passed")
+
+var shortcut = ShortcutGesture()
+assert(!shortcut.up())
+shortcut.down()
+shortcut.down() // OS repeat must not start and immediately send.
+assert(shortcut.up())
+assert(!shortcut.up())
+shortcut.down()
+assert(shortcut.up())
+print("Shortcut press/release checks passed")

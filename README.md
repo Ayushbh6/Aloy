@@ -47,3 +47,17 @@ Experimental pronunciation feedback accepts a short mono 16 kHz WAV recording wi
 ## Current boundary
 
 Live audio is a bounded, click-to-record native audio exchange after recording stops. The first build does not stream microphone frames while you speak. The repaired warm Gemini Lite plus Pocket route emitted first audio in a median 1.11 seconds across three tiny synthetic samples; this excludes microphone/STT time and is not an acoustic latency measurement. German curriculum, learner mastery, generative lesson visuals, screen context, wake words and proactive reminders remain future work. See [engineering rules](docs/ENGINEERING.md), [implementation plan](docs/INITIAL_PLAN.md), and the current [repair review](docs/REPAIR_REVIEW.md).
+
+## Global voice shortcut
+
+With Aloy running, press and release **Option + Space** to record from any app.
+Press and release it again to send; the selected speech engine reads the reply.
+The panel stays closed. The orb is red while capturing. Using the shortcut during
+playback interrupts that reply and starts a new recording. Hold/repeat generates
+only one action on release. Record / Finish & Send use the same native functions.
+A shortcut conflict produces an alert rather than silently failing. This shortcut
+requires Aloy to be running; it does not wake a sleeping Mac or launch a quit app.
+Microphone permission is required; no accessibility key-monitoring permission is used.
+The existing five-minute recording limit still applies.
+
+Voice wake research is in [VOICE_ACTIVATION.md](docs/VOICE_ACTIVATION.md).

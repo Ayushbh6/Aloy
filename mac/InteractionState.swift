@@ -33,3 +33,14 @@ struct OperationGate {
     mutating func invalidate() { id = UUID().uuidString }
     func accepts(_ operationID: String) -> Bool { operationID == id }
 }
+
+// A held shortcut is one gesture, regardless of key-repeat events.
+struct ShortcutGesture {
+    private var pressed = false
+    mutating func down() { pressed = true }
+    mutating func up() -> Bool {
+        let fire = pressed
+        pressed = false
+        return fire
+    }
+}

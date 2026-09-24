@@ -1,9 +1,11 @@
 import AppKit
 import AVFoundation
+import Carbon
 
 // A quiet ink panel and one luminous blue orb; the orb breathes while Aloy speaks.
 final class OrbView: NSView {
     var onClick: (() -> Void)?
+    var isRecording = false { didSet { needsDisplay = true } }
     var isSpeaking = false { didSet { needsDisplay = true } }
     private var gesture = OrbGesture()
     override var isOpaque: Bool { false }
@@ -12,7 +14,7 @@ final class OrbView: NSView {
         NSColor(calibratedRed: 0.22, green: 0.44, blue: 0.94, alpha: isSpeaking ? 0.34 : 0.18).setFill()
         NSBezierPath(ovalIn: outer).fill()
         let inner = bounds.insetBy(dx: isSpeaking ? 7 : 9, dy: isSpeaking ? 7 : 9)
-        NSColor(calibratedRed: 0.29, green: 0.51, blue: 0.98, alpha: 1).setFill()
+        (isRecording ? NSColor.systemRed : NSColor(calibratedRed: 0.29, green: 0.51, blue: 0.98, alpha: 1)).setFill()
         NSBezierPath(ovalIn: inner).fill()
         NSColor.white.withAlphaComponent(0.9).setFill()
         NSBezierPath(ovalIn: NSRect(x: bounds.midX - 4, y: bounds.midY - 4, width: 8, height: 8)).fill()
@@ -33,6 +35,9 @@ final class OrbView: NSView {
 
 final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDelegate,
                            AVAudioPlayerDelegate, NSTextFieldDelegate {
+    private var hotKey: EventHotKeyRef?
+    private var hotKeyHandler: EventHandlerRef?
+    private var shortcutGesture = ShortcutGesture()
     private var backend: Process?
     private var backendInput: FileHandle?
     private var orbWindow: NSWindow!
@@ -68,13 +73,48 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
         buildOrb()
         buildPanel()
         startBackend()
+        registerVoiceShortcut()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        if let hotKey { UnregisterEventHotKey(hotKey) }
+        if let hotKeyHandler { RemoveEventHandler(hotKeyHandler) }
         recorder?.stop()
         // Unfinished capture remains in Aloy/tmp for recovery on next launch.
         player?.stop()
         backend?.terminate()
+    }
+
+    private func registerVoiceShortcut() {
+        var events = [
+            EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed)),
+            EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyReleased))
+        ]
+        let context = Unmanaged.passUnretained(self).toOpaque()
+        let installed = InstallEventHandler(GetApplicationEventTarget(), { _, event, context in
+            guard let event, let context else { return OSStatus(eventNotHandledErr) }
+            let owner = Unmanaged<AppController>.fromOpaque(context).takeUnretainedValue()
+            if GetEventKind(event) == UInt32(kEventHotKeyPressed) {
+                owner.shortcutGesture.down()
+            } else if owner.shortcutGesture.up() {
+                owner.toggleRecording()
+            }
+            return noErr
+        }, events.count, &events, context, &hotKeyHandler)
+        let registered = installed == noErr ? RegisterEventHotKey(
+            UInt32(kVK_Space), UInt32(optionKey),
+            EventHotKeyID(signature: 0x414C4F59, id: 1),
+            GetApplicationEventTarget(), 0, &hotKey
+        ) : installed
+        if registered != noErr {
+            status.stringValue = "Option–Space unavailable; use Record"
+            let alert = NSAlert()
+            alert.messageText = "Aloy could not register Option–Space"
+            alert.informativeText = "Another application may own this shortcut. Record and Finish & Send still work in Aloy's panel."
+            alert.runModal()
+        }
+        orb.toolTip = "Option–Space: record / send. Click to open Aloy."
+        recordButton.toolTip = "Option–Space works from other apps too"
     }
 
     private func label(_ title: String, frame: NSRect, size: CGFloat = 12,
@@ -464,7 +504,7 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
 
     @objc private func toggleRecording() {
         if recorder != nil { finishRecording(); return }
-        guard dataRoot != nil, conversationID != nil, !microphoneRequestPending else { return }
+        guard dataRoot != nil, conversationID != nil, !microphoneRequestPending else { NSSound.beep(); return }
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
         case .authorized:
             startRecording()
@@ -491,6 +531,8 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
     private func finishRecording() {
         let previous = recorder
         recorder = nil
+        orb.isRecording = false
+        orb.toolTip = "Processing — Option–Space to start a new recording"
         previous?.stop()
         recordButton.title = "Record"
         stopButton.title = "Stop"
@@ -529,6 +571,8 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
             }
             candidate.delegate = self
             recorder = candidate
+            orb.isRecording = true
+            orb.toolTip = "Recording — Option–Space to send"
             recordedPath = url.path
             recordButton.title = "Finish & Send"
             status.stringValue = "Recording… Finish & Send, or Cancel recording"
@@ -547,6 +591,7 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
         let duration = recorder?.currentTime ?? 0
         let previousRecorder = recorder
         recorder = nil
+        orb.isRecording = false
         previousRecorder?.stop()
         let cancelledPath = recordedPath
         recordedPath = nil
