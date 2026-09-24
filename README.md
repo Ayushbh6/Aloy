@@ -5,19 +5,23 @@ persistent context, and scheduled follow-through. The first intended use is a Ge
 
 ## Status
 
-Foundation only: installable Python package, reproducible development environment,
+Foundation only: installable Python package, pinned development dependencies,
 engineering rules and an implementation plan. No agent, voice service, scheduler,
 model connection or desktop interface is implemented yet.
 
 ## Development
 
-Requires Python 3.13 and uv.
+Requires Python 3.13. Use standard venv and pip.
 
 ```sh
-uv sync --locked
-uv run ruff check .
-uv run ruff format --check .
-uv run python -c "import aloy; print(aloy.__file__)"
+python3.13 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements-dev.txt
+python -m pip install -e .
+python -m pip check
+python -m ruff check .
+python -m ruff format --check .
+python -c "import aloy; print(aloy.__file__)"
 ```
 
 Pytest is installed for meaningful behavioral tests as the runtime is implemented.

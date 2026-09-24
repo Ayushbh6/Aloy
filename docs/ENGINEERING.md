@@ -56,5 +56,5 @@ hidden remote reasoning or tool steps.
 Inspect existing ownership before adding a function. Extend canonical contracts and
 implementation, update affected adapters, and test real boundary behavior. Cover tool
 continuations, malformed outputs, cancellation, budget exhaustion and provider errors.
-Run lint, format and relevant tests. Add CI once meaningful runtime tests exist.
+Run lint, format and relevant tests. Extend the existing foundation CI with meaningful runtime tests as they are added.
 Document remaining limitations honestly. Do not add abstractions without an immediate use.

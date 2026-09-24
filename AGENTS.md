@@ -4,6 +4,9 @@ Keep responses concise. Read README.md, docs/ENGINEERING.md and docs/INITIAL_PLA
 before work. If present, also read local MEMORY.md, .local/CONTEXT.md and
 .local/HANDOVER.md. These ignored files contain private owner context; do not publish them.
 
+Use Python 3.13 with standard venv and pip. Development pins live in requirements-dev.txt.
+Do not introduce a parallel dependency workflow.
+
 ## Non-negotiable architecture
 
 - Write our own orchestration functions and classes. No LangChain, LlamaIndex,
