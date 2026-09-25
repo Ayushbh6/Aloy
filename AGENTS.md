@@ -87,3 +87,10 @@ Speech quality work is offline-first. Paid speech is a last resort, never an aut
 fallback. Detect speech before ASR; no-speech captures must never reach the agent.
 Compare candidates on actual local recordings and human voice auditions; do not claim
 a globally best model from a tiny benchmark. Keep only the selected model weights.
+
+Current Standard speech output options are exactly Chatterbox local, direct Gemini
+3.8 Flash-Lite TTS, and OpenRouter Grok Voice TTS 1.0. Voice selection is per engine;
+defaults are the existing warm-male Chatterbox reference, Gemini Achird, and Grok Sal
+(the last still needs owner audition). Chatterbox needs reference WAVs rather than
+invented named presets. Gemini Live is a separate explicit audio mode. Confirm current
+IDs in source and provider docs before changing these routes.

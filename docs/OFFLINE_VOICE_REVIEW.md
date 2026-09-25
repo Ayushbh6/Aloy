@@ -194,3 +194,25 @@ provider and speaker onset.
 The 46 offline Python checks, native interaction tests, build, and dependency
 checks pass. Physical microphone activity monitoring in the rebuilt app still
 needs owner validation.
+
+## Current Standard speech picker — 25 September 2026
+
+This section supersedes the six-choice paid picker described above. The owner
+requested only Chatterbox local, direct Gemini 3.8 Flash-Lite TTS, and OpenRouter
+`x-ai/grok-voice-tts-1.0` for Standard speech output. The panel has a separate
+voice dropdown and persists a selection for each engine. The initial voices are
+the existing warm male Chatterbox WAV, Gemini Achird, and Grok Sal. Gemini's 30
+prebuilt IDs and the five Grok IDs offered through OpenRouter are selectable.
+Chatterbox has one installed reference; adding consented local WAV references
+offers more choices without another model download. Grok Sal still needs the
+owner's voice and German-language audition. Gemini Live stays a distinct mode.
+
+At commit `95dd7cf`, 54 offline Python tests, Ruff, Swift compilation and native
+menu inspection passed. A local Chatterbox generation returned 1.36 seconds of
+WAV audio. Separate bounded one-dispatch real checks passed for direct Gemini
+Achird (4.3 seconds, $0.000242 estimated) and OpenRouter Grok Sal (0.89 seconds,
+$0.000240 estimated). These tiny synthetic checks establish request and playback-
+asset routing, not long-form quality, cost at 120 hours, or end-to-end latency.
+No additional model weights were downloaded; the existing dedicated model cache
+remained about 5.3 GiB. Earlier local comparisons are historical, not the
+current voice lineup.
