@@ -13,7 +13,7 @@ from aloy.bridge import PROMPT, Bridge
 from aloy.dispatch import DispatchBudget
 from aloy.providers import load_local_env
 from aloy.speech import SpeechAudio, make_synthesizer
-from aloy.speech_catalog import BY_ID
+from aloy.speech_catalog import BY_ID, resolve_voice
 
 
 class FakeSpeech:
@@ -37,9 +37,10 @@ class FakeSpeech:
         pass
 
 
-async def run(option_id: str, mode: str) -> dict:
+async def run(option_id: str, mode: str, voice: str | None = None) -> dict:
     load_local_env()
     option = BY_ID[option_id]
+    voice = resolve_voice(option_id, voice)
     temporary = tempfile.TemporaryDirectory(prefix="aloy-speech-fake-") if mode == "fake" else None
     previous_root = os.environ.get("ALOY_DATA_DIR")
     if temporary:
@@ -53,11 +54,16 @@ async def run(option_id: str, mode: str) -> dict:
         bridge = Bridge()
         bridge.emit = lambda kind, **fields: events.append((kind, fields.get("error")))
         conversation_id = bridge.store.create_conversation(PROMPT, "Synthetic speech check")
-        synthesizer = FakeSpeech() if mode == "fake" else make_synthesizer(option_id)
+        synthesizer = FakeSpeech() if mode == "fake" else make_synthesizer(option_id, voice)
         synthesizer.dispatch = DispatchBudget(limit=1)
-        bridge.synthesizers[option_id] = synthesizer
+        bridge.synthesizers[(option_id, voice)] = synthesizer
         await bridge.run_turn(
-            conversation_id, "Synthetic greeting", "fake", option_id, bridge.epoch
+            conversation_id,
+            "Synthetic greeting",
+            "fake",
+            option_id,
+            bridge.epoch,
+            speech_voice=voice,
         )
         assets = bridge.store.audio_assets(conversation_id)
         kinds = [kind for kind, _ in events]
@@ -65,6 +71,7 @@ async def run(option_id: str, mode: str) -> dict:
         return {
             "mode": mode,
             "option": option_id,
+            "voice": voice,
             "model": option.model,
             "result": "passed" if passed else "failed",
             "dispatches": synthesizer.dispatch.count,
@@ -79,6 +86,7 @@ async def run(option_id: str, mode: str) -> dict:
         return {
             "mode": mode,
             "option": option_id,
+            "voice": voice,
             "model": option.model,
             "result": "failed",
             "dispatches": synthesizer.dispatch.count if synthesizer else 0,
@@ -104,12 +112,13 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=("fake", "live"), default="fake")
     parser.add_argument("--option", choices=tuple(BY_ID))
+    parser.add_argument("--voice", help="Voice ID offered by this speech option")
     args = parser.parse_args()
     if args.option is None:
         args.option = "gemini-lite"
     if args.mode == "live" and BY_ID[args.option].provider == "local":
         parser.error("Live mode requires a paid speech option")
-    evidence = asyncio.run(run(args.option, args.mode))
+    evidence = asyncio.run(run(args.option, args.mode, args.voice))
     print(json.dumps(evidence, sort_keys=True))
     if evidence["result"] != "passed":
         raise SystemExit(1)

@@ -7,14 +7,13 @@ import re
 import subprocess
 import threading
 import wave
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Protocol
 
 from aloy.models import MODELS, cache_dir, model_path
-from aloy.speech_catalog import BY_ID
+from aloy.speech_catalog import BY_ID, local_reference, resolve_voice
 from aloy.speech_worker import SpeechWorker
-from aloy.storage import data_root
 
 os.environ.setdefault("HF_HOME", str(cache_dir().parent))
 
@@ -42,18 +41,6 @@ def wav_audio(data: bytes) -> SpeechAudio:
             raise RuntimeError("Speech engine returned empty WAV audio")
         duration = reader.getnframes() / reader.getframerate()
     return SpeechAudio(data, "wav", duration)
-
-
-def pcm_audio(data: bytes, sample_rate: int = 24000) -> SpeechAudio:
-    if not data or len(data) % 2 or len(data) > 20_000_000:
-        raise RuntimeError("Speech engine returned unexpected PCM audio")
-    output = io.BytesIO()
-    with wave.open(output, "wb") as writer:
-        writer.setnchannels(1)
-        writer.setsampwidth(2)
-        writer.setframerate(sample_rate)
-        writer.writeframes(data)
-    return wav_audio(output.getvalue())
 
 
 def mp3_audio(data: bytes) -> SpeechAudio:
@@ -229,13 +216,13 @@ class MLXTranscriber:
 
 
 class ChatterboxSynthesizer:
-    """One fixed local voice, conditioned once per worker lifetime."""
+    """One selected reference voice, conditioned once per worker lifetime."""
 
-    def __init__(self, reference_path: Path | None = None) -> None:
-        self.reference_path = reference_path or data_root() / "models" / "chatterbox-reference.wav"
+    def __init__(self, voice: str = "warm-male") -> None:
+        self.reference_path = local_reference(voice)
         self._model = None
         self._conditionals = None
-        self.worker = SpeechWorker("chatterbox-tts")
+        self.worker = SpeechWorker(f"chatterbox-tts:{voice}")
 
     @staticmethod
     def language_code(text: str) -> str:
@@ -333,14 +320,16 @@ class ChatterboxSynthesizer:
         self._conditionals = None
 
 
-def make_synthesizer(name: str) -> Synthesizer:
+def make_synthesizer(name: str, voice: str | None = None) -> Synthesizer:
     option = BY_ID.get(name)
     if option is None:
         raise ValueError(f"Unknown TTS engine: {name}")
+    selected_voice = resolve_voice(name, voice)
     if option.provider == "local":
-        return ChatterboxSynthesizer()
+        return ChatterboxSynthesizer(selected_voice)
     from aloy.paid_speech import GeminiSynthesizer, OpenRouterSynthesizer
 
+    option = replace(option, voice=selected_voice)
     return (
         GeminiSynthesizer(option) if option.provider == "gemini" else OpenRouterSynthesizer(option)
     )

@@ -9,7 +9,12 @@ from types import SimpleNamespace
 import pytest
 
 from aloy.speech import SpeechAudio, mp3_audio, wav_audio
-from aloy.speech_catalog import BY_ID, selectable_options, speech_cost, speech_reservation
+from aloy.speech_catalog import (
+    BY_ID,
+    selectable_options,
+    speech_cost,
+    speech_reservation,
+)
 
 
 def silent_wav() -> bytes:
@@ -27,14 +32,10 @@ def test_catalog_has_distinct_local_direct_and_router_choices():
     assert {
         "chatterbox",
         "gemini-lite",
-        "gemini-flash",
-        "router-gemini-lite",
-        "router-gemini-flash",
         "router-grok",
-        "none",
     } == ids
     assert speech_cost(BY_ID["chatterbox"], "Hallo", 5) == 0
-    for name in ids - {"chatterbox", "none"}:
+    for name in ids - {"chatterbox"}:
         assert speech_reservation(BY_ID[name], "Hallo Ayush.") > speech_cost(
             BY_ID[name], "Hallo Ayush.", 2
         )
@@ -63,7 +64,11 @@ def test_gemini_interactions_uses_selected_voice_and_one_dispatch(monkeypatch):
     monkeypatch.setattr("aloy.paid_speech.gemini_client", lambda _: client)
 
     async def scenario():
-        synth = GeminiSynthesizer(BY_ID["gemini-lite"], api_key="synthetic")
+        from dataclasses import replace
+
+        synth = GeminiSynthesizer(
+            replace(BY_ID["gemini-lite"], voice="Sulafat"), api_key="synthetic"
+        )
         await synth.preflight()
         result = await synth.synthesize("Hallo Ayush.")
         assert result.extension == "wav"
@@ -71,7 +76,7 @@ def test_gemini_interactions_uses_selected_voice_and_one_dispatch(monkeypatch):
         assert synth.dispatch.count == 1
         assert calls[0][1]["model"] == "gemini-3.8-flash-lite-tts"
         payload = calls[1][1]
-        assert payload["generation_config"]["speech_config"] == [{"voice": "Achird"}]
+        assert payload["generation_config"]["speech_config"] == [{"voice": "Sulafat"}]
         assert payload["input"][0]["content"][0]["text"] == "Hallo Ayush."
         await synth.close()
 
@@ -94,7 +99,7 @@ def test_openrouter_uses_speech_endpoint_and_exact_model_voice(monkeypatch):
                     "data": [
                         {
                             "id": "x-ai/grok-voice-tts-1.0",
-                            "supported_voices": ["leo"],
+                            "supported_voices": ["sal", "ara"],
                             "pricing": {"prompt": "0.000015", "completion": "0"},
                         }
                     ]
@@ -115,7 +120,11 @@ def test_openrouter_uses_speech_endpoint_and_exact_model_voice(monkeypatch):
     )
 
     async def scenario():
-        synth = OpenRouterSynthesizer(BY_ID["router-grok"], api_key="synthetic")
+        from dataclasses import replace
+
+        synth = OpenRouterSynthesizer(
+            replace(BY_ID["router-grok"], voice="ara"), api_key="synthetic"
+        )
         await synth.preflight()
         result = await synth.synthesize("Guten Morgen.")
         assert result.extension == "mp3"
@@ -124,57 +133,9 @@ def test_openrouter_uses_speech_endpoint_and_exact_model_voice(monkeypatch):
         assert calls[1][2]["json"] == {
             "model": "x-ai/grok-voice-tts-1.0",
             "input": "Guten Morgen.",
-            "voice": "leo",
+            "voice": "ara",
             "response_format": "mp3",
         }
-        await synth.close()
-
-    asyncio.run(scenario())
-
-
-def test_openrouter_gemini_uses_pcm_and_speech_metadata(monkeypatch):
-    import httpx
-
-    from aloy.paid_speech import OpenRouterSynthesizer
-
-    calls = []
-
-    class Client:
-        async def get(self, path, **kwargs):
-            return httpx.Response(
-                200,
-                json={
-                    "data": [
-                        {
-                            "id": "google/gemini-3.8-flash-lite-tts",
-                            "supported_voices": ["Achird"],
-                            "pricing": {"prompt": "0.0000005", "completion": "0.000006"},
-                        }
-                    ]
-                },
-            )
-
-        async def post(self, path, **kwargs):
-            calls.append(kwargs["json"])
-            return httpx.Response(
-                200,
-                content=b"\0\0" * 24000,
-                headers={"content-type": "audio/pcm"},
-            )
-
-        async def aclose(self):
-            pass
-
-    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: Client())
-
-    async def scenario():
-        synth = OpenRouterSynthesizer(BY_ID["router-gemini-lite"], api_key="synthetic")
-        await synth.preflight()
-        result = await synth.synthesize("Guten Morgen.")
-        assert result.extension == "wav"
-        assert result.duration_seconds == 1
-        assert calls[0]["response_format"] == "pcm"
-        assert calls[0]["provider"]["options"]["google-ai-studio"]["speech_metadata"]
         await synth.close()
 
     asyncio.run(scenario())
@@ -197,7 +158,7 @@ def test_paid_reply_uses_shared_storage_and_spend_ledger(tmp_path, monkeypatch):
     async def scenario():
         monkeypatch.setenv("ALOY_DATA_DIR", str(tmp_path))
         synth = Speech()
-        monkeypatch.setattr("aloy.bridge.make_synthesizer", lambda _: synth)
+        monkeypatch.setattr("aloy.bridge.make_synthesizer", lambda *_: synth)
         bridge = Bridge()
         bridge.emit = lambda *args, **kwargs: None
         cid = bridge.store.create_conversation(PROMPT)
@@ -228,7 +189,7 @@ def test_budget_blocks_paid_speech_before_dispatch(tmp_path, monkeypatch):
     async def scenario():
         monkeypatch.setenv("ALOY_DATA_DIR", str(tmp_path))
         synth = Speech()
-        monkeypatch.setattr("aloy.bridge.make_synthesizer", lambda _: synth)
+        monkeypatch.setattr("aloy.bridge.make_synthesizer", lambda *_: synth)
         bridge = Bridge()
         events = []
         bridge.emit = lambda kind, **fields: events.append(kind)

@@ -68,8 +68,8 @@ def main():
     engine = sys.argv[1]
     if engine.startswith("asr:"):
         model = MLXTranscriber(engine.split(":", 1)[1])
-    elif engine == "chatterbox-tts":
-        model = ChatterboxSynthesizer()
+    elif engine.startswith("chatterbox-tts:"):
+        model = ChatterboxSynthesizer(engine.split(":", 1)[1])
     else:
         raise ValueError("Unknown speech worker")
     for line in sys.stdin:

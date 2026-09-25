@@ -21,6 +21,9 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
     private var historyPicker: NSPopUpButton!
     private var providerPicker: NSPopUpButton!
     private var speechPicker: NSPopUpButton!
+    private var voicePicker: NSPopUpButton!
+    private var speechOptions: [[String: Any]] = []
+    private var savedVoices: [String: String] = [:]
     private var modePicker: NSPopUpButton!
     private var conversationID: String?
     private var dataRoot: String?
@@ -164,7 +167,7 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
         canvas.addSubview(button("New", frame: NSRect(x: 290, y: 421, width: 82, height: 28),
                                  action: #selector(newConversation)))
 
-        let scroll = NSScrollView(frame: NSRect(x: 20, y: 188, width: 352, height: 221))
+        let scroll = NSScrollView(frame: NSRect(x: 20, y: 203, width: 352, height: 206))
         scroll.hasVerticalScroller = true
         scroll.borderType = .noBorder
         transcript = NSTextView(frame: scroll.bounds)
@@ -176,19 +179,19 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
         scroll.documentView = transcript
         canvas.addSubview(scroll)
 
-        entry = NSTextField(frame: NSRect(x: 20, y: 147, width: 270, height: 29))
+        entry = NSTextField(frame: NSRect(x: 20, y: 164, width: 270, height: 29))
         entry.placeholderString = "Talk to Aloy…"
         entry.delegate = self
         canvas.addSubview(entry)
-        canvas.addSubview(button("Send", frame: NSRect(x: 299, y: 147, width: 73, height: 29),
+        canvas.addSubview(button("Send", frame: NSRect(x: 299, y: 164, width: 73, height: 29),
                                  action: #selector(sendText)))
-        recordButton = button("Record", frame: NSRect(x: 20, y: 109, width: 166, height: 29),
+        recordButton = button("Record", frame: NSRect(x: 20, y: 127, width: 166, height: 29),
                               action: #selector(toggleRecording))
         canvas.addSubview(recordButton)
-        stopButton = button("Stop", frame: NSRect(x: 195, y: 109, width: 177, height: 29),
+        stopButton = button("Stop", frame: NSRect(x: 195, y: 127, width: 177, height: 29),
                             action: #selector(stopAction))
         canvas.addSubview(stopButton)
-        let replayButton = button("Replay", frame: NSRect(x: 20, y: 73, width: 108, height: 29),
+        let replayButton = button("Replay", frame: NSRect(x: 20, y: 91, width: 108, height: 29),
                                   action: #selector(replayAudio))
         replayButton.toolTip = "Replay the last reply. Right-click to replay your last recording."
         let replayMenu = NSMenu()
@@ -197,9 +200,9 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
         replayMenu.addItem(replayInput)
         replayButton.menu = replayMenu
         canvas.addSubview(replayButton)
-        canvas.addSubview(button("Storage", frame: NSRect(x: 142, y: 73, width: 108, height: 29),
+        canvas.addSubview(button("Storage", frame: NSRect(x: 142, y: 91, width: 108, height: 29),
                                  action: #selector(showStorage)))
-        canvas.addSubview(button("Delete", frame: NSRect(x: 264, y: 73, width: 108, height: 29),
+        canvas.addSubview(button("Delete", frame: NSRect(x: 264, y: 91, width: 108, height: 29),
                                  action: #selector(deleteConversation)))
 
         providerPicker = NSPopUpButton(frame: NSRect(x: 20, y: 24, width: 115, height: 28))
@@ -213,6 +216,13 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
         speechPicker.target = self
         speechPicker.action = #selector(settingsChanged)
         canvas.addSubview(speechPicker)
+        canvas.addSubview(label("Voice", frame: NSRect(x: 22, y: 59, width: 42, height: 20),
+                                size: 11, weight: .medium))
+        voicePicker = NSPopUpButton(frame: NSRect(x: 65, y: 55, width: 307, height: 28))
+        voicePicker.isEnabled = false
+        voicePicker.target = self
+        voicePicker.action = #selector(settingsChanged)
+        canvas.addSubview(voicePicker)
         modePicker = NSPopUpButton(frame: NSRect(x: 272, y: 24, width: 100, height: 28))
         modePicker.addItems(withTitles: ["Standard", "Live audio"])
         modePicker.target = self
@@ -302,12 +312,15 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
         case "ready":
             dataRoot = object["root"] as? String
             let settings = object["settings"] as? [String: String] ?? [:]
+            speechOptions = object["speech_options"] as? [[String: Any]] ?? []
+            savedVoices = settings.filter { $0.key.hasPrefix("voice:") }
             speechPicker.removeAllItems()
-            for option in object["speech_options"] as? [[String: String]] ?? [] {
-                guard let id = option["id"], let title = option["title"] else { continue }
+            for option in speechOptions {
+                guard let id = option["id"] as? String,
+                      let title = option["title"] as? String else { continue }
                 speechPicker.addItem(withTitle: title)
                 speechPicker.lastItem?.representedObject = id
-                speechPicker.lastItem?.toolTip = option["detail"]
+                speechPicker.lastItem?.toolTip = option["detail"] as? String
             }
             speechPicker.isEnabled = speechPicker.numberOfItems > 0
             if let provider = settings["provider"],
@@ -318,6 +331,7 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
                let item = speechPicker.itemArray.first(where: { $0.representedObject as? String == speech }) {
                 speechPicker.select(item)
             }
+            refreshVoices()
             if settings["mode"] == "live" { modePicker.selectItem(at: 1) }
             status.stringValue = "Ready"
             command("list")
@@ -500,17 +514,42 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
     private var provider: String {
         ["gemini", "openrouter", "gemini-quality", "codex", "fake"][providerPicker.indexOfSelectedItem]
     }
-    private var speech: String? {
-        let selected = speechPicker.selectedItem?.representedObject as? String ?? "chatterbox"
-        return selected == "none" ? nil : selected
+    private var speech: String {
+        speechPicker.selectedItem?.representedObject as? String ?? "chatterbox"
+    }
+    private var voice: String {
+        voicePicker.selectedItem?.representedObject as? String ?? "warm-male"
     }
 
-    @objc private func settingsChanged() {
+    private func refreshVoices() {
+        voicePicker.removeAllItems()
+        guard let option = speechOptions.first(where: { $0["id"] as? String == speech }) else { return }
+        for choice in option["voices"] as? [[String: String]] ?? [] {
+            guard let id = choice["id"], let title = choice["title"] else { continue }
+            voicePicker.addItem(withTitle: title)
+            voicePicker.lastItem?.representedObject = id
+        }
+        let selected = savedVoices["voice:\(speech)"] ?? option["default_voice"] as? String
+        if let item = voicePicker.itemArray.first(where: { $0.representedObject as? String == selected }) {
+            voicePicker.select(item)
+        }
+        voicePicker.isEnabled = voicePicker.numberOfItems > 0
+    }
+
+    @objc private func settingsChanged(_ sender: NSPopUpButton) {
         stopAction()
-        command("set_setting", ["key": "provider", "value": provider])
-        command("set_setting", ["key": "speech", "value": speech ?? "none"])
-        command("set_setting", ["key": "mode",
-                                "value": modePicker.indexOfSelectedItem == 1 ? "live" : "standard"])
+        if sender === speechPicker {
+            refreshVoices()
+            command("set_setting", ["key": "speech", "value": speech])
+        } else if sender === voicePicker {
+            savedVoices["voice:\(speech)"] = voice
+            command("set_setting", ["key": "voice:\(speech)", "value": voice])
+        } else if sender === providerPicker {
+            command("set_setting", ["key": "provider", "value": provider])
+        } else {
+            command("set_setting", ["key": "mode",
+                                    "value": modePicker.indexOfSelectedItem == 1 ? "live" : "standard"])
+        }
     }
 
     @objc private func sendText() {
@@ -525,7 +564,7 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
         stopPlayback()
         append("You: \(text)\n\n")
         command("send", ["conversation_id": id, "text": text,
-                         "provider": provider, "speech": speech as Any? ?? NSNull()])
+                         "provider": provider, "speech": speech, "voice": voice])
     }
 
     @objc private func toggleRecording() {
@@ -566,7 +605,7 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
         guard let id = conversationID, let path = recordedPath else { return }
         recordedPath = nil
         command("recorded", ["conversation_id": id, "path": path,
-                             "provider": provider, "speech": speech as Any? ?? NSNull(),
+                             "provider": provider, "speech": speech, "voice": voice,
                              "mode": modePicker.indexOfSelectedItem == 1 ? "live" : "standard"])
         orb.isProcessing = true
         status.stringValue = "Processing recording…"
@@ -607,7 +646,7 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
             status.stringValue = "Recording… Finish & Send, or Cancel recording"
             stopButton.title = "Cancel recording"
             if modePicker.indexOfSelectedItem == 0 {
-                command("prewarm_speech", ["speech": speech as Any? ?? NSNull()])
+                command("prewarm_speech", ["speech": speech, "voice": voice])
                 startVoiceMonitor()
             }
         } catch {

@@ -206,7 +206,7 @@ def test_standard_audio_links_and_speech_error_cleanup(tmp_path, monkeypatch):
 
     async def scenario():
         monkeypatch.setenv("ALOY_DATA_DIR", str(tmp_path))
-        monkeypatch.setattr("aloy.bridge.make_synthesizer", lambda _: Speech())
+        monkeypatch.setattr("aloy.bridge.make_synthesizer", lambda *_: Speech())
         bridge = Bridge()
         bridge.emit = lambda *args, **kwargs: None
         cid = bridge.store.create_conversation(PROMPT)
@@ -249,7 +249,7 @@ def test_recording_prewarm_reuses_the_reply_synthesizer(tmp_path, monkeypatch):
         monkeypatch.setenv("ALOY_DATA_DIR", str(tmp_path))
         created = []
 
-        def factory(_):
+        def factory(*_):
             created.append(Speech())
             return created[-1]
 
@@ -288,7 +288,7 @@ def test_stop_cancels_local_speech_without_audio(tmp_path, monkeypatch):
                 finally:
                     cancelled.set()
 
-        monkeypatch.setattr("aloy.bridge.make_synthesizer", lambda _: SlowSpeech())
+        monkeypatch.setattr("aloy.bridge.make_synthesizer", lambda *_: SlowSpeech())
         bridge = Bridge()
         events = []
         bridge.emit = lambda event, **kw: events.append(event)

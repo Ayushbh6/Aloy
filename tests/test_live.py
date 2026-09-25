@@ -118,13 +118,19 @@ def test_bridge_settings_persist_and_reject_unknown_values(tmp_path, monkeypatch
         events = []
         bridge.emit = lambda kind, **data: events.append((kind, data))
         await bridge.handle({"v": 1, "action": "set_setting", "key": "provider", "value": "fake"})
-        await bridge.handle({"v": 1, "action": "set_setting", "key": "speech", "value": "none"})
+        await bridge.handle(
+            {"v": 1, "action": "set_setting", "key": "speech", "value": "router-grok"}
+        )
+        await bridge.handle(
+            {"v": 1, "action": "set_setting", "key": "voice:router-grok", "value": "ara"}
+        )
         await bridge.handle({"v": 1, "action": "set_setting", "key": "mode", "value": "live"})
         await bridge.handle({"v": 1, "action": "set_setting", "key": "mode", "value": "unknown"})
         assert events[-1][0] == "error"
         assert bridge.store.settings() == {
             "provider": "fake",
-            "speech": "none",
+            "speech": "router-grok",
+            "voice:router-grok": "ara",
             "mode": "live",
         }
         bridge.store.close()
