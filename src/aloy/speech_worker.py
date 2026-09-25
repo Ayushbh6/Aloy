@@ -27,7 +27,7 @@ class SpeechWorker:
                 process.kill()
                 await process.wait()
 
-    async def request(self, value: str):
+    async def request(self, value: str | dict[str, str]):
         async with self.lock:
             try:
                 async with asyncio.timeout(90):
@@ -63,33 +63,31 @@ class SpeechWorker:
 
 
 def main():
-    from aloy.speech import (
-        ChatterboxSynthesizer,
-        MLXTranscriber,
-        PocketSynthesizer,
-        QwenSynthesizer,
-    )
+    from aloy.speech import ChatterboxSynthesizer, MLXTranscriber
 
     engine = sys.argv[1]
     if engine.startswith("asr:"):
         model = MLXTranscriber(engine.split(":", 1)[1])
-    elif engine.startswith("qwen-tts:"):
-        model = QwenSynthesizer(engine.split(":", 1)[1])
     elif engine == "chatterbox-tts":
         model = ChatterboxSynthesizer()
-    elif engine == "tts":
-        model = PocketSynthesizer()
     else:
         raise ValueError("Unknown speech worker")
     for line in sys.stdin:
         try:
             value = json.loads(line)
             with contextlib.redirect_stdout(sys.stderr):
-                result = (
-                    model._transcribe(Path(value))
-                    if engine.startswith("asr:")
-                    else base64.b64encode(model._synthesize(value)).decode()
-                )
+                if value == {"command": "prewarm"}:
+                    if engine.startswith("asr:"):
+                        model._prewarm()
+                    else:
+                        model._load()
+                    result = ""
+                else:
+                    result = (
+                        model._transcribe(Path(value))
+                        if engine.startswith("asr:")
+                        else base64.b64encode(model._synthesize(value)).decode()
+                    )
             packet = {"result": result}
         except Exception as exc:
             packet = {"error": f"Local {engine} failed: {type(exc).__name__}"}

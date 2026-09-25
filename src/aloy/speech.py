@@ -1,6 +1,5 @@
 """Speech engines around, never inside, the shared text agent."""
 
-import asyncio
 import base64
 import io
 import os
@@ -11,7 +10,6 @@ import wave
 from pathlib import Path
 from typing import Protocol
 
-from aloy.dispatch import DispatchBudget, gemini_client
 from aloy.models import MODELS, cache_dir, model_path
 from aloy.speech_worker import SpeechWorker
 from aloy.storage import data_root
@@ -66,6 +64,43 @@ def to_16k_wav(input_path: Path) -> bytes:
     return result.stdout
 
 
+def speech_window(timestamps: list[dict], sample_rate: int, total_samples: int) -> slice:
+    """Trim only outside the spoken span; keep hesitations and pauses inside it."""
+    margin = int(sample_rate * 0.25)
+    start = max(0, int(timestamps[0]["start"]) - margin)
+    end = min(total_samples, int(timestamps[-1]["end"]) + margin)
+    return slice(start, end)
+
+
+def pcm_for_transcription(audio_path: Path, sample_rate: int):
+    import numpy as np
+
+    def read(source):
+        with wave.open(source, "rb") as reader:
+            if (reader.getnchannels(), reader.getsampwidth(), reader.getframerate()) != (
+                1,
+                2,
+                sample_rate,
+            ):
+                raise ValueError("Audio needs conversion before transcription")
+            return np.frombuffer(reader.readframes(reader.getnframes()), dtype="<i2")
+
+    try:
+        return read(str(audio_path))
+    except (ValueError, wave.Error):
+        if sample_rate != 16000:
+            raise ValueError("Unsupported VAD sample rate") from None
+        return read(io.BytesIO(to_16k_wav(audio_path)))
+
+
+def audio_for_transcription(audio_path: Path):
+    import mlx.core as mx
+    import numpy as np
+
+    samples = pcm_for_transcription(audio_path, 16000)
+    return mx.array(samples.astype(np.float32) / 32768), len(samples)
+
+
 class MLXTranscriber:
     def __init__(self, model_name: str = "qwen-asr") -> None:
         self.model_name = model_name
@@ -73,6 +108,16 @@ class MLXTranscriber:
         self._vad = None
         self._lock = threading.Lock()
         self.worker = SpeechWorker("asr:" + model_name)
+
+    def _prewarm(self) -> None:
+        from mlx_audio.stt.utils import load_model
+        from mlx_audio.vad.utils import load_model as load_vad
+
+        with self._lock:
+            if self._vad is None:
+                self._vad = load_vad(model_path("vad"))
+            if self._model is None:
+                self._model = load_model(model_path(self.model_name))
 
     def _transcribe(self, audio_path: Path) -> str:
         from mlx_audio.stt.utils import load_model
@@ -84,8 +129,10 @@ class MLXTranscriber:
                 from mlx_audio.vad.utils import load_model as load_vad
 
                 self._vad = load_vad(model_path("vad"))
+            audio, sample_count = audio_for_transcription(audio_path)
             detection = self._vad.generate(
-                str(audio_path),
+                audio,
+                sample_rate=16000,
                 threshold=0.6,
                 min_speech_duration_ms=180,
                 min_silence_duration_ms=160,
@@ -95,92 +142,27 @@ class MLXTranscriber:
                 return ""
             if self._model is None:
                 self._model = load_model(model_path(self.model_name))
+            window = speech_window(detection.timestamps, detection.sample_rate, sample_count)
+            spoken_audio = audio[window]
             options = (
                 {"system_prompt": "Aloy, Ayush. English and German conversation."}
                 if self.model_name == "qwen-asr"
                 else {}
             )
-            result = self._model.generate(str(audio_path), **options)
+            result = self._model.generate(spoken_audio, **options)
             return result.text.strip()
 
     async def transcribe(self, audio_path: Path) -> str:
         return await self.worker.request(str(audio_path))
 
-    async def close(self) -> None:
-        await self.worker.close()
-        self.unload()
-
-    def unload(self) -> None:
-        self._model = None
-
-
-class PocketSynthesizer:
-    def __init__(self) -> None:
-        self._model = None
-        self._voice = None
-        self._lock = threading.Lock()
-        self.worker = SpeechWorker("tts")
-
-    def _synthesize(self, text: str) -> bytes:
-        from pocket_tts import TTSModel
-
-        with self._lock:
-            if self._model is None:
-                # The packaged German config falls back to its ungated, non-cloning weights.
-                self._model = TTSModel.load_model(language="german")
-            if self._voice is None:
-                self._voice = self._model.get_state_for_audio_prompt("juergen")
-            audio = self._model.generate_audio(self._voice, text)
-            return pcm_to_wav(audio.numpy(), self._model.sample_rate)
-
-    async def synthesize(self, text: str) -> bytes:
-        return base64.b64decode(await self.worker.request(text))
+    async def prewarm(self) -> None:
+        await self.worker.request({"command": "prewarm"})
 
     async def close(self) -> None:
         await self.worker.close()
         self.unload()
 
     def unload(self) -> None:
-        self._model = None
-        self._voice = None
-
-
-class QwenSynthesizer:
-    """One reusable local TTS adapter; voice variants share weights and code."""
-
-    def __init__(self, voice: str = "Ryan") -> None:
-        self.voice = voice
-        self._model = None
-        self.worker = SpeechWorker("qwen-tts:" + voice)
-
-    def _synthesize(self, text: str) -> bytes:
-        import mlx.core as mx
-        from mlx_audio.tts.utils import load_model
-
-        if self._model is None:
-            self._model = load_model(model_path("qwen-tts"))
-        chunks = list(
-            self._model.generate_custom_voice(
-                text=text,
-                speaker=self.voice,
-                language="auto",
-                instruct=(
-                    "Speak naturally and clearly, like a friendly young adult. "
-                    "Warm conversational tone, no theatrical delivery."
-                ),
-                temperature=0.65,
-                max_tokens=2048,
-            )
-        )
-        if not chunks:
-            raise RuntimeError("Local TTS returned no audio")
-        return pcm_to_wav(mx.concatenate([chunk.audio for chunk in chunks]), chunks[0].sample_rate)
-
-    async def synthesize(self, text: str) -> bytes:
-        return base64.b64decode(await self.worker.request(text))
-
-    async def close(self) -> None:
-        await self.worker.close()
         self._model = None
 
 
@@ -241,7 +223,7 @@ class ChatterboxSynthesizer:
             return "de" if len(german) > len(english) else "en"
         return "de" if words & {"für", "schön", "über", "üben"} else "en"
 
-    def _synthesize(self, text: str) -> bytes:
+    def _load(self) -> None:
         from mlx_audio.tts.models.chatterbox.chatterbox import Model
 
         if self._model is None:
@@ -259,6 +241,9 @@ class ChatterboxSynthesizer:
                 str(self.reference_path), 24000, exaggeration=0.5
             )
             self._model, self._conditionals = model, conditionals
+
+    def _synthesize(self, text: str) -> bytes:
+        self._load()
         chunks = list(
             self._model.generate(
                 text=text,
@@ -277,69 +262,16 @@ class ChatterboxSynthesizer:
     async def synthesize(self, text: str) -> bytes:
         return base64.b64decode(await self.worker.request(text))
 
+    async def prewarm(self) -> None:
+        await self.worker.request({"command": "prewarm"})
+
     async def close(self) -> None:
         await self.worker.close()
         self._model = None
         self._conditionals = None
 
 
-class GeminiSynthesizer:
-    def __init__(self, api_key: str | None = None, voice: str = "Achird") -> None:
-
-        api_key = api_key or os.environ.get("GEMINI_API_KEY")
-        if not api_key:
-            raise ValueError("GEMINI_API_KEY is missing")
-        self.client = gemini_client(api_key)
-        self.dispatch = DispatchBudget()
-        self.voice = voice
-
-    async def close(self):
-        await self.client.aio.aclose()
-        self.client.close()
-
-    async def synthesize(self, text: str) -> bytes:
-        async with asyncio.timeout(45):
-            self.dispatch.consume()
-            interaction = await self.client.aio.interactions.create(
-                model="gemini-3.8-flash-lite-tts",
-                input=[
-                    {
-                        "type": "user_input",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": text,
-                                "annotations": [
-                                    {
-                                        "type": "speech_metadata",
-                                        "style": "warm, natural, conversational",
-                                    }
-                                ],
-                            }
-                        ],
-                    }
-                ],
-                response_format={"type": "audio"},
-                generation_config={
-                    "speech_config": [{"voice": self.voice}],
-                    "max_output_tokens": 2048,
-                },
-            )
-        if not interaction.output_audio or not interaction.output_audio.data:
-            raise RuntimeError("Gemini TTS returned no audio")
-        data = base64.b64decode(interaction.output_audio.data)
-        if not data.startswith(b"RIFF") or len(data) > 20_000_000:
-            raise RuntimeError("Gemini TTS returned unexpected audio")
-        return data
-
-
 def make_synthesizer(name: str) -> Synthesizer:
-    if name in {"qwen", "qwen-aiden"}:
-        return QwenSynthesizer("Aiden" if name == "qwen-aiden" else "Ryan")
-    if name == "gemini":
-        return GeminiSynthesizer()
     if name == "chatterbox":
         return ChatterboxSynthesizer()
-    if name == "pocket":
-        return PocketSynthesizer()
     raise ValueError(f"Unknown TTS engine: {name}")

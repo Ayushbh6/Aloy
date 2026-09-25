@@ -186,8 +186,7 @@ def test_dispatch_cap():
     assert guard.count == 1
 
 
-@pytest.mark.parametrize("engine", ["pocket", "chatterbox"])
-def test_standard_audio_links_and_speech_error_cleanup(tmp_path, monkeypatch, engine):
+def test_standard_audio_links_and_speech_error_cleanup(tmp_path, monkeypatch):
     import io
     import wave
 
@@ -210,7 +209,7 @@ def test_standard_audio_links_and_speech_error_cleanup(tmp_path, monkeypatch, en
         bridge = Bridge()
         bridge.emit = lambda *args, **kwargs: None
         cid = bridge.store.create_conversation(PROMPT)
-        await bridge.run_turn(cid, "Q", "fake", engine, bridge.epoch)
+        await bridge.run_turn(cid, "Q", "fake", "chatterbox", bridge.epoch)
         assets = bridge.store.audio_assets(cid)
         assert assets and all(a["run_id"] and a["message_id"] for a in assets)
         assert bridge.store.monthly_spend() == 0
@@ -219,7 +218,60 @@ def test_standard_audio_links_and_speech_error_cleanup(tmp_path, monkeypatch, en
     asyncio.run(scenario())
 
 
-def test_stop_cancels_speech_and_keeps_uncertain_paid_reservation(tmp_path, monkeypatch):
+def test_recording_prewarm_reuses_the_reply_synthesizer(tmp_path, monkeypatch):
+    import io
+    import wave
+
+    from aloy.bridge import PROMPT
+
+    output = io.BytesIO()
+    with wave.open(output, "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(16000)
+        wav.writeframes(b"\0\0" * 160)
+
+    class Speech:
+        def __init__(self):
+            self.warms = 0
+            self.replies = 0
+
+        async def prewarm(self):
+            self.warms += 1
+
+        async def synthesize(self, text):
+            self.replies += 1
+            return output.getvalue()
+
+    async def scenario():
+        monkeypatch.setenv("ALOY_DATA_DIR", str(tmp_path))
+        created = []
+
+        def factory(_):
+            created.append(Speech())
+            return created[-1]
+
+        monkeypatch.setattr("aloy.bridge.make_synthesizer", factory)
+        bridge = Bridge()
+
+        async def warm_asr():
+            return None
+
+        bridge.transcriber.prewarm = warm_asr
+        bridge.emit = lambda *args, **kwargs: None
+        cid = bridge.store.create_conversation(PROMPT)
+        await bridge.handle({"v": 1, "action": "prewarm_speech", "speech": "chatterbox"})
+        await bridge.warm_task
+        await bridge.run_turn(cid, "Q", "fake", "chatterbox", bridge.epoch)
+        assert len(created) == 1
+        assert created[0].warms == 1
+        assert created[0].replies == 1
+        bridge.store.close()
+
+    asyncio.run(scenario())
+
+
+def test_stop_cancels_local_speech_without_audio(tmp_path, monkeypatch):
     from aloy.bridge import PROMPT
 
     async def scenario():
@@ -246,14 +298,14 @@ def test_stop_cancels_speech_and_keeps_uncertain_paid_reservation(tmp_path, monk
                 "conversation_id": cid,
                 "text": "Q",
                 "provider": "fake",
-                "speech": "gemini",
+                "speech": "chatterbox",
             }
         )
         await started.wait()
         await bridge.stop()
         assert cancelled.is_set()
         assert "audio" not in events
-        assert bridge.store.monthly_spend() > 0
+        assert bridge.store.monthly_spend() == 0
         assert bridge.active is None
         bridge.store.close()
 
@@ -414,6 +466,7 @@ def test_vad_rejection_precedes_asr_load(monkeypatch, tmp_path):
 
     module.load_model = forbidden
     monkeypatch.setitem(sys.modules, "mlx_audio.stt.utils", module)
+    monkeypatch.setattr("aloy.speech.audio_for_transcription", lambda _: (object(), 512))
     transcriber = MLXTranscriber()
     transcriber._vad = SimpleNamespace(
         generate=lambda *args, **kwargs: SimpleNamespace(timestamps=[])
@@ -437,6 +490,7 @@ def test_vad_failure_cannot_bypass_gate(monkeypatch, tmp_path):
 
     module.load_model = forbidden
     monkeypatch.setitem(sys.modules, "mlx_audio.stt.utils", module)
+    monkeypatch.setattr("aloy.speech.audio_for_transcription", lambda _: (object(), 512))
     transcriber = MLXTranscriber()
     transcriber._vad = SimpleNamespace(generate=detector_failure)
     with pytest.raises(RuntimeError, match="Detector unavailable"):

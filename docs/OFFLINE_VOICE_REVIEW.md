@@ -59,7 +59,7 @@ check, not a validated pronunciation or human naturalness judgment. Ryan remains
 initial selection; both are available in the voice picker. Owner listening feedback
 is pending. First-use latency is materially higher than the old lightweight voice.
 
-The complete installed offline STT -> fake agent -> Qwen TTS pipeline succeeded for
+The historical offline STT -> fake agent -> Qwen TTS pipeline succeeded for
 both actual spoken captures. The known silent capture emitted only no_speech in
 0.21 seconds and no agent/audio response. Warm capture-to-generated-audio took 2.10
 seconds; cold took 11.00 seconds. These use a fake text provider and therefore do not
@@ -97,9 +97,9 @@ natural back-and-forth; owner feedback on longer auditions may change the choice
 
 The existing Gemini Interactions TTS adapter generated two comparable 10-second
 samples using `gemini-3.8-flash-lite-tts`. Full synthesis took 7.18 and 7.97 seconds.
-The owner liked both and preferred the warm male Achird voice, which is now the voice
-used by the explicit Gemini speech option. The app's selected speech engine did not
-silently switch from offline to paid. Google documents `stream=True` for incremental
+The owner liked both and preferred the warm male Achird voice for that paid
+comparison. It was later removed from Standard mode when Chatterbox became the
+owner's sole selected voice. Google documents `stream=True` for incremental
 raw PCM audio; the current Aloy adapter still waits for a complete WAV per sentence,
 so its measured synthesis time is not a first-audio latency claim. Streaming playback
 would need a compatible native audio queue and cancellation/accounting tests.
@@ -129,16 +129,58 @@ has not been auditioned here. [ElevenLabs API pricing](https://elevenlabs.io/pri
 The native orb now keeps one green speaking appearance across gaps between audio
 chunks, turns red only for recording and stays blue while awaiting the first audio.
 Option + Z and Option + X remain the same one-hand shortcuts. Native state tests,
-41 offline Python checks and lint pass. The rebuilt app and Python backend launched.
+41 offline Python checks and lint passed at that stage. The rebuilt app and Python backend launched.
 
 ## Storage and reproducibility
 
 Selected ASR, VAD, Chatterbox and tokenizer files occupy about 5.3 GiB. Qwen TTS,
 old 0.6B ASR, Pocket and Parakeet comparison weights, incomplete downloads and
 temporary downloader scripts were removed. User recordings remain intact. Small
-private evidence and voice auditions are ignored by Git.
+private evidence and retained microphone captures are ignored by Git. Synthetic
+audition files and orb screenshots were removed after the voice choice.
 
 The comparison harness uses production adapters: scripts/check_local_speech.py.
 Inputs and output evidence belong outside Git. Model registry entries allow explicit
 future comparisons, but default downloads/pruning retain only the selected four
 model components (one TTS voice, its tokenizer, ASR and VAD).
+
+## Single-voice and latency follow-up
+
+The owner confirmed Chatterbox as the best offline voice audition and requested
+that other TTS engines be removed. Standard mode now accepts only Chatterbox or
+text-only output. Pocket, Qwen TTS and Gemini TTS adapters and model registry
+entries were removed. Pocket TTS, PyTorch and their unused dependencies were
+uninstalled from Aloy's own runtime, reducing that environment from about 1.6
+GiB to 647 MiB. ASR, Silero VAD, Chatterbox and its tokenizer remain; user audio
+and conversations were not pruned. Gemini Live remains a separate explicit mode.
+
+Chatterbox and ASR prewarm while the microphone is open. In one adapter check,
+Chatterbox loading and reference conditioning took 2.53 seconds; a following
+short German reply took 3.65 seconds to generate 2.8 seconds of speech. With
+both speech workers prewarmed, a separate capture-to-fake-reply check took 5.61
+seconds from recording end to a playable file. The direct constituent timings
+were 0.45 seconds for FFmpeg conversion, 0.99 seconds for warm ASR and 2.21
+seconds for a short Chatterbox reply. These vary with model startup and Mac
+memory pressure and exclude a real text-provider call. A local
+CFG-weight comparison (0.3 versus 0) showed no consistent speed gain, so the
+accepted voice settings were retained. This does not meet the original median
+three-second response-to-first-audio target; no claim of streaming is made.
+
+Silero now monitors PCM from the open microphone and reports a speech start
+after two positive 32 ms frames. A pause state requires about 1.2 seconds of
+quiet, but never sends automatically; Option + Z remains the only send action.
+The final VAD gate still rejects silence before ASR, and only the outside of
+the detected speech span is trimmed, with a 250 ms extra margin. All pauses
+and fillers between the first and last detected speech remain in the audio
+passed to ASR. Existing real captures produced no speech for the silence
+control and speech/pause events for English and German samples. A repeated
+real capture separated by two seconds of silence yielded speech, pause, speech,
+pause, without ending capture. A later one-pass VAD/ASR change kept the known
+silence control empty and recovered both English and German captures without
+word edits; the warm German transcription took 0.71 seconds in that check.
+Two isolated prewarmed fake-provider turns on the final one-pass decoder reached
+first playable audio 3.54 and 3.26 seconds after submission, excluding a real
+provider and speaker onset.
+The 46 offline Python checks, native interaction tests, build, and dependency
+checks pass. Physical microphone activity monitoring in the rebuilt app still
+needs owner validation.

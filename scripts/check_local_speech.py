@@ -12,7 +12,7 @@ import resource
 import time
 from pathlib import Path
 
-from aloy.speech import MLXTranscriber, QwenSynthesizer
+from aloy.speech import ChatterboxSynthesizer, MLXTranscriber
 
 
 def word_errors(reference, hypothesis):
@@ -33,7 +33,7 @@ async def run(args):
     output.mkdir(parents=True, exist_ok=True)
     evidence = {"asr": [], "tts": [], "paid_calls": 0}
     if args.manifest:
-        transcriber = MLXTranscriber(args.model)
+        transcriber = MLXTranscriber()
         try:
             for item in json.loads(args.manifest.read_text()):
                 started = time.monotonic()
@@ -47,8 +47,8 @@ async def run(args):
                 )
         finally:
             await transcriber.close()
-    if args.voice:
-        synth = QwenSynthesizer(args.voice)
+    if args.tts:
+        synth = ChatterboxSynthesizer()
         try:
             for language, text in [
                 ("en", "Hey Ayush. Good to hear from you. How was your day?"),
@@ -56,7 +56,7 @@ async def run(args):
             ]:
                 started = time.monotonic()
                 audio = await synth.synthesize(text)
-                path = output / f"{args.voice}-{language}.wav"
+                path = output / f"chatterbox-{language}.wav"
                 path.write_bytes(audio)
                 evidence["tts"].append({"file": path.name, "seconds": time.monotonic() - started})
         finally:
@@ -71,7 +71,6 @@ async def run(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--manifest", type=Path)
-    parser.add_argument("--model", choices=["qwen-asr", "parakeet"], default="qwen-asr")
-    parser.add_argument("--voice", choices=["Ryan", "Aiden"])
+    parser.add_argument("--tts", action="store_true")
     parser.add_argument("--output", required=True, type=Path)
     asyncio.run(run(parser.parse_args()))

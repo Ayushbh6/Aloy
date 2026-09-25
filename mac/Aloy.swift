@@ -9,6 +9,7 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
     private var shortcutGestures: [UInt32: ShortcutGesture] = [:]
     private var backend: Process?
     private var backendInput: FileHandle?
+    private let backendWriteQueue = DispatchQueue(label: "Aloy.BackendWrites")
     private var orbWindow: NSWindow!
     private var panel: NSWindow!
     private var orb: OrbView!
@@ -24,6 +25,8 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
     private var conversationID: String?
     private var dataRoot: String?
     private var recorder: AVAudioRecorder?
+    private var voiceMonitor: AVAudioEngine?
+    private var voiceMonitorID: String?
     private var recordedPath: String?
     private var microphoneRequestPending = false
     private var player: AVAudioPlayer?
@@ -55,6 +58,8 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
         for hotKey in hotKeys { UnregisterEventHotKey(hotKey) }
         if let hotKeyHandler { RemoveEventHandler(hotKeyHandler) }
         recorder?.stop()
+        voiceMonitor?.inputNode.removeTap(onBus: 0)
+        voiceMonitor?.stop()
         // Unfinished capture remains in Aloy/tmp for recovery on next launch.
         player?.stop()
         backend?.terminate()
@@ -203,8 +208,8 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
         providerPicker.action = #selector(settingsChanged)
         canvas.addSubview(providerPicker)
         speechPicker = NSPopUpButton(frame: NSRect(x: 148, y: 24, width: 105, height: 28))
-        speechPicker.addItems(withTitles: ["Chatterbox · Local", "Achird · API", "Text only"])
-        speechPicker.toolTip = "Chatterbox runs locally. Achird uses paid Gemini speech under Aloy's $30 monthly cap."
+        speechPicker.addItems(withTitles: ["Chatterbox · Local", "Text only"])
+        speechPicker.toolTip = "Chatterbox is Aloy's only speech voice and runs locally."
         speechPicker.target = self
         speechPicker.action = #selector(settingsChanged)
         canvas.addSubview(speechPicker)
@@ -281,7 +286,8 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
         object["id"] = UUID().uuidString
         guard let data = try? JSONSerialization.data(withJSONObject: object),
               let input = backendInput else { return }
-        input.write(data + Data([10]))
+        let packet = data + Data([10])
+        backendWriteQueue.async { input.write(packet) }
     }
 
     private func append(_ text: String) {
@@ -301,7 +307,7 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
                 providerPicker.selectItem(at: index)
             }
             if let speech = settings["speech"],
-               let index = ["chatterbox", "gemini", "none"].firstIndex(of: speech) {
+               let index = ["chatterbox", "none"].firstIndex(of: speech) {
                 speechPicker.selectItem(at: index)
             }
             if settings["mode"] == "live" { modePicker.selectItem(at: 1) }
@@ -375,6 +381,11 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
         case "transcript":
             append("You: \(object["text"] as? String ?? "")\n\n")
             status.stringValue = "Thinking…"
+        case "speech_activity":
+            guard recorder != nil, object["session_id"] as? String == voiceMonitorID else { return }
+            status.stringValue = object["state"] as? String == "speech"
+                ? "Hearing you…"
+                : "Paused — keep speaking, or Option–Z to send"
         case "audio":
             if let path = object["path"] as? String, let id = object["asset_id"] as? String {
                 replyAudio.audioArrived()
@@ -482,7 +493,7 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
         ["gemini", "openrouter", "gemini-quality", "codex", "fake"][providerPicker.indexOfSelectedItem]
     }
     private var speech: String? {
-        let choices = ["chatterbox", "gemini", "none"]
+        let choices = ["chatterbox", "none"]
         let selected = choices[speechPicker.indexOfSelectedItem]
         return selected == "none" ? nil : selected
     }
@@ -537,6 +548,7 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
     }
 
     private func finishRecording() {
+        stopVoiceMonitor()
         let previous = recorder
         recorder = nil
         orb.isRecording = false
@@ -587,13 +599,67 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
             recordButton.title = "Finish & Send"
             status.stringValue = "Recording… Finish & Send, or Cancel recording"
             stopButton.title = "Cancel recording"
+            if modePicker.indexOfSelectedItem == 0 {
+                command("prewarm_speech", ["speech": speech as Any? ?? NSNull()])
+                startVoiceMonitor()
+            }
         } catch {
             try? FileManager.default.removeItem(at: url)
             status.stringValue = "Microphone unavailable"
         }
     }
 
+    private func startVoiceMonitor() {
+        let engine = AVAudioEngine()
+        let input = engine.inputNode
+        let format = input.outputFormat(forBus: 0)
+        guard format.sampleRate >= 8000, format.channelCount > 0 else { return }
+        let session = UUID().uuidString
+        voiceMonitorID = session
+        command("vad_start", ["session_id": session, "sample_rate": Int(format.sampleRate)])
+        input.installTap(onBus: 0, bufferSize: 4096, format: format) { [weak self] buffer, _ in
+            let count = Int(buffer.frameLength)
+            guard count > 0 else { return }
+            var samples = [Int16](repeating: 0, count: count)
+            if let channel = buffer.floatChannelData?[0] {
+                for index in 0..<count {
+                    let value = max(-1.0, min(1.0, channel[index]))
+                    samples[index] = Int16(littleEndian: Int16(value * 32767))
+                }
+            } else if let channel = buffer.int16ChannelData?[0] {
+                for index in 0..<count { samples[index] = channel[index].littleEndian }
+            } else { return }
+            let data = samples.withUnsafeBytes { Data($0) }
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.voiceMonitorID == session, self.recorder != nil else { return }
+                self.command("vad_audio", ["session_id": session,
+                                           "pcm": data.base64EncodedString()])
+            }
+        }
+        do {
+            try engine.start()
+            voiceMonitor = engine
+        } catch {
+            input.removeTap(onBus: 0)
+            voiceMonitorID = nil
+            command("vad_end", ["session_id": session])
+            status.stringValue = "Recording… speech activity monitor unavailable"
+        }
+    }
+
+    private func stopVoiceMonitor() {
+        let session = voiceMonitorID
+        voiceMonitorID = nil
+        if let engine = voiceMonitor {
+            engine.inputNode.removeTap(onBus: 0)
+            engine.stop()
+        }
+        voiceMonitor = nil
+        if let session { command("vad_end", ["session_id": session]) }
+    }
+
     @objc private func stopAction() {
+        stopVoiceMonitor()
         orb.hasError = false
         orb.isProcessing = false
         operation.invalidate()

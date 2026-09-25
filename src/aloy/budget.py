@@ -8,14 +8,6 @@ MONTHLY_LIMIT_USD = 30.0
 MONTHLY_WARNING_USD = 20.0
 
 
-def tts_cost(seconds: float, characters: int) -> float:
-    """Estimate Gemini 3.8 Flash-Lite TTS standard tier with the dated price step."""
-    new_price = datetime.now(UTC).date().isoformat() >= "2027-01-01"
-    audio_per_second = 0.00030 if new_price else 0.00015
-    text_per_million = 1.0 if new_price else 0.5
-    return round(seconds * audio_per_second + characters / 4 * text_per_million / 1e6, 8)
-
-
 # USD per million tokens. These are estimates, not provider invoices.
 RATES = {
     "deepseek/deepseek-v4.1-flash": (0.30, 1.20),

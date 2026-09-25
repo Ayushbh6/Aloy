@@ -1,6 +1,7 @@
 """Versioned JSON-lines transport for the thin macOS shell."""
 
 import asyncio
+import base64
 import json
 import re
 import sys
@@ -11,13 +12,14 @@ from contextvars import ContextVar
 from pathlib import Path
 
 from aloy import AgentConfig, ChatAgent, ConversationStore
-from aloy.budget import MONTHLY_WARNING_USD, tts_cost
+from aloy.budget import MONTHLY_WARNING_USD
 from aloy.contracts import Usage
 from aloy.errors import safe_error
 from aloy.lifecycle import RunLifecycle
 from aloy.live import MAX_SECONDS, GeminiLive, _pcm_from_wav
 from aloy.providers import MODEL_PRESETS, load_local_env, make_provider
 from aloy.speech import MLXTranscriber, make_synthesizer, to_16k_wav
+from aloy.vad import StreamingVoiceDetector
 
 OPERATION = ContextVar("operation", default=None)
 VERSION = 1
@@ -32,8 +34,12 @@ class Bridge:
     def __init__(self) -> None:
         load_local_env()
         self.store = ConversationStore()
+        if self.store.settings().get("speech") not in (None, "chatterbox", "none"):
+            self.store.set_setting("speech", "chatterbox")
         self.transcriber = MLXTranscriber()
+        self.voice_monitor = StreamingVoiceDetector()
         self.synthesizers = {}
+        self.warm_task: asyncio.Task | None = None
         self.active: asyncio.Task | None = None
         self.epoch = 0
 
@@ -57,6 +63,25 @@ class Bridge:
         self.active = None
         self.emit("stopped")
 
+    async def warm_speech(self, engine: str | None) -> None:
+        try:
+            tasks = [self.transcriber.prewarm()]
+            if engine == "chatterbox":
+                synthesizer = self.synthesizers.get("chatterbox")
+                if synthesizer is None:
+                    synthesizer = make_synthesizer("chatterbox")
+                    self.synthesizers["chatterbox"] = synthesizer
+                tasks.append(synthesizer.prewarm())
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for result in results:
+                if isinstance(result, Exception):
+                    raise result
+            self.emit("speech_warm")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.emit("speech_error", error=safe_error(exc))
+
     async def speak(
         self, queue: asyncio.Queue, conversation_id: str, engine: str, epoch: int, run_ref: dict
     ) -> bool:
@@ -69,34 +94,24 @@ class Bridge:
                 if synthesizer is None:
                     synthesizer = make_synthesizer(engine)
                     self.synthesizers[engine] = synthesizer
-                reservation = (
-                    tts_cost(90, len(sentence.encode("utf-8")) * 4) if engine == "gemini" else 0.0
+                data = await synthesizer.synthesize(sentence)
+                with wave.open(__import__("io").BytesIO(data), "rb") as reader:
+                    duration = reader.getnframes() / reader.getframerate()
+                if epoch != self.epoch:
+                    return False
+                run_id = run_ref["id"]
+                asset = self.store.save_audio(
+                    conversation_id,
+                    data,
+                    direction="output",
+                    extension="wav",
+                    duration_seconds=duration,
+                    provider=engine,
+                    estimated_usd=0.0,
+                    run_id=run_id,
+                    message_id=self.store.message_id(run_id, "assistant"),
+                    accounted=True,
                 )
-                reservation_id = self.store.reserve(reservation)
-                try:
-                    self.store.mark_dispatched(reservation_id)
-                    data = await synthesizer.synthesize(sentence)
-                    with wave.open(__import__("io").BytesIO(data), "rb") as reader:
-                        duration = reader.getnframes() / reader.getframerate()
-                    estimate = tts_cost(duration, len(sentence)) if engine == "gemini" else 0.0
-                    self.store.settle(reservation_id, estimate)
-                    if epoch != self.epoch:
-                        return False
-                    run_id = run_ref["id"]
-                    asset = self.store.save_audio(
-                        conversation_id,
-                        data,
-                        direction="output",
-                        extension="wav",
-                        duration_seconds=duration,
-                        provider=engine,
-                        estimated_usd=estimate,
-                        run_id=run_id,
-                        message_id=self.store.message_id(run_id, "assistant"),
-                        accounted=True,
-                    )
-                finally:
-                    self.store.settle(reservation_id)
                 self.emit(
                     "audio",
                     path=asset["path"],
@@ -373,6 +388,31 @@ class Bridge:
                 await self.stop()
             if action == "metric":
                 self.store.record_client_metric(request["kind"], float(request["value"]))
+            elif action == "vad_start":
+                await asyncio.to_thread(
+                    self.voice_monitor.start,
+                    request["session_id"],
+                    int(request["sample_rate"]),
+                )
+            elif action == "vad_audio":
+                payload = request["pcm"]
+                if len(payload) > 100_000:
+                    raise ValueError("Microphone frame exceeds transport limit")
+                change = await asyncio.to_thread(
+                    self.voice_monitor.feed,
+                    request["session_id"],
+                    base64.b64decode(payload, validate=True),
+                )
+                if change:
+                    self.emit("speech_activity", session_id=request["session_id"], state=change)
+            elif action == "vad_end":
+                self.voice_monitor.stop(request["session_id"])
+            elif action == "prewarm_speech":
+                engine = request.get("speech")
+                if engine not in (None, "chatterbox"):
+                    raise ValueError("Unknown speech engine")
+                if self.warm_task is None or self.warm_task.done():
+                    self.warm_task = asyncio.create_task(self.warm_speech(engine))
             elif action == "cancel_recording":
                 self.retain_cancelled_recording(
                     request["conversation_id"],
@@ -412,13 +452,16 @@ class Bridge:
                 key, value = request["key"], request["value"]
                 allowed = {
                     "provider": set(MODEL_PRESETS),
-                    "speech": {"qwen", "qwen-aiden", "chatterbox", "pocket", "gemini", "none"},
+                    "speech": {"chatterbox", "none"},
                     "mode": {"standard", "live"},
                 }
                 if key not in allowed or value not in allowed[key]:
                     raise ValueError("Unsupported setting")
                 await self.stop()
                 if key == "speech":
+                    if value == "none" and self.warm_task and not self.warm_task.done():
+                        self.warm_task.cancel()
+                        await asyncio.gather(self.warm_task, return_exceptions=True)
                     for engine, synthesizer in list(self.synthesizers.items()):
                         if engine != value and hasattr(synthesizer, "close"):
                             await synthesizer.close()
@@ -433,14 +476,7 @@ class Bridge:
                 if provider_name not in MODEL_PRESETS:
                     raise ValueError("Unknown provider")
                 speech_engine = request.get("speech", "chatterbox")
-                if speech_engine not in (
-                    None,
-                    "gemini",
-                    "pocket",
-                    "qwen",
-                    "qwen-aiden",
-                    "chatterbox",
-                ):
+                if speech_engine not in (None, "chatterbox"):
                     raise ValueError("Unknown speech engine")
                 conversation_id = request["conversation_id"]
                 if action == "send":
@@ -503,6 +539,9 @@ async def main() -> None:
                 bridge.emit("error", error=f"Invalid request: {exc}")
     finally:
         await bridge.stop()
+        if bridge.warm_task and not bridge.warm_task.done():
+            bridge.warm_task.cancel()
+            await asyncio.gather(bridge.warm_task, return_exceptions=True)
         await bridge.transcriber.close()
         for synthesizer in bridge.synthesizers.values():
             if hasattr(synthesizer, "close"):

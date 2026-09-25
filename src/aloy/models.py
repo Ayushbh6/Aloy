@@ -7,11 +7,6 @@ from pathlib import Path
 from aloy.storage import data_root
 
 MODELS = {
-    "qwen-tts": (
-        "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-8bit",
-        "41d3337e8b7f2843a75841595fc14e4b9a7a4b96",
-        ["*.json", "*.safetensors", "*.txt"],
-    ),
     "chatterbox": (
         "mlx-community/chatterbox-multilingual-v3",
         "03565773edd72e949572557597af8063bb49a18a",
@@ -27,25 +22,10 @@ MODELS = {
         "7bc17f22d3c0451bd3a6cd71e759b009271ff49a",
         ["config.json", "model.safetensors"],
     ),
-    "parakeet": (
-        "mlx-community/parakeet-tdt-0.6b-v3",
-        "ed2b7e8c15f9aaa0b5772e2efb986255eaef7e15",
-        ["*.json", "*.safetensors", "*.model", "*.vocab", "*.txt"],
-    ),
     "qwen-asr": (
         "mlx-community/Qwen3-ASR-1.7B-8bit",
         "a8379a2e2f9e313c9292cdf1af4055ab56d50d55",
         ["*.json", "*.safetensors", "*.model", "*.tiktoken", "*.txt"],
-    ),
-    "pocket-german": (
-        "kyutai/pocket-tts-without-voice-cloning",
-        "4e1e0a3e611c51c0b4ed8174fc10f32a54644303",
-        [
-            "languages/german/model.safetensors",
-            "languages/german/tokenizer.json",
-            "languages/german/tokenizer.model",
-            "languages/german/embeddings/juergen.safetensors",
-        ],
     ),
 }
 
