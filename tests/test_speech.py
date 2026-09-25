@@ -47,14 +47,20 @@ def test_selected_voice_reaches_shared_turn_and_invalid_voice_cannot_dispatch(
 ):
     import asyncio
 
+    from aloy.agent import FakeProvider
     from aloy.bridge import PROMPT, Bridge
     from aloy.speech import SpeechAudio
+
+    utterances = []
+    answer = "Hey Ayush! I'm doing well. My name is Aloy. How are you?"
+    monkeypatch.setattr("aloy.bridge.make_provider", lambda *_: FakeProvider(answer))
 
     class Synth:
         async def preflight(self):
             pass
 
         async def synthesize(self, text):
+            utterances.append(text)
             return SpeechAudio(b"ID3" + b"x" * 100, "mp3", 1)
 
     async def scenario():
@@ -71,6 +77,7 @@ def test_selected_voice_reaches_shared_turn_and_invalid_voice_cannot_dispatch(
         cid = bridge.store.create_conversation(PROMPT)
         await bridge.run_turn(cid, "Hello", "fake", "router-grok", bridge.epoch, speech_voice="ara")
         assert selected == [("router-grok", "ara")]
+        assert utterances == [answer]
         assert len(bridge.store.audio_assets(cid)) == 1
         await bridge.handle(
             {

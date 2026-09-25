@@ -39,7 +39,12 @@ class GeminiSynthesizer:
                                 "annotations": [
                                     {
                                         "type": "speech_metadata",
-                                        "style": "warm, natural, conversational",
+                                        "style": (
+                                            "Warm, natural, conversational; speak as one flowing "
+                                            "utterance. Pronounce the name Aloy as Ah-loy "
+                                            "(two syllables, Ah then loy), not Ee-loy or Eli. "
+                                            "Do not speak these pronunciation instructions."
+                                        ),
                                     }
                                 ],
                             }

@@ -1,0 +1,17 @@
+{
+  "event": "action_requested",
+  "proposal_id": "00000000-0000-4000-8000-000000000001",
+  "operation_id": "operation-fixture",
+  "run_id": "run-fixture",
+  "tool_call_id": "tool-call-fixture",
+  "action": "desktop.click",
+  "target": {
+    "bundle_id": "com.apple.Safari",
+    "window_id": 123
+  },
+  "parameters": {
+    "x": 0.25,
+    "y": 0.75
+  },
+  "expires_at": "2099-01-01T00:00:00Z"
+}

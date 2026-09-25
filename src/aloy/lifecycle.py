@@ -15,6 +15,9 @@ class RunLifecycle:
         model: str,
         text: str,
         reservation: float,
+        *,
+        externally_accounted: bool = False,
+        input_origin: str = "user",
     ):
         self.store = store
         self.conversation_id = conversation_id
@@ -23,12 +26,18 @@ class RunLifecycle:
         self.partial = ""
         self.usage = Usage()
         self.finished = False
+        self.externally_accounted = externally_accounted
+        self.input_origin = input_origin
 
     def __enter__(self):
         with self.store.transaction():
-            self.reservation_id = self.store.reserve(self.reservation)
+            self.reservation_id = self.store.reserve(self.reservation, provider=self.provider)
             self.run_id = self.store.begin_run(
-                self.conversation_id, self.provider, self.model, self.text
+                self.conversation_id,
+                self.provider,
+                self.model,
+                self.text,
+                input_origin=self.input_origin,
             )
         return self
 
@@ -45,7 +54,12 @@ class RunLifecycle:
             self.store.attach_run_audio(self.run_id)
             # Only a completed response with known usage releases unused allowance.
             self.store.settle(
-                self.reservation_id, self.usage.estimated_usd if status == "completed" else None
+                self.reservation_id,
+                0.0
+                if self.externally_accounted
+                else self.usage.estimated_usd
+                if status == "completed"
+                else None,
             )
         self.finished = True
 

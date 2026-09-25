@@ -22,5 +22,13 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
-      - run: swiftc mac/InteractionState.swift mac/OrbView.swift mac/tests/main.swift -framework AppKit -o "$RUNNER_TEMP/aloy-check" && "$RUNNER_TEMP/aloy-check"
-      - run: swiftc -swift-version 5 mac/Aloy.swift mac/OrbView.swift mac/InteractionState.swift -framework AppKit -framework AVFoundation -o "$RUNNER_TEMP/Aloy"
+      - name: Native interaction and model checks
+        shell: bash
+        run: |
+          sources=(mac/InteractionState.swift mac/OrbView.swift mac/Playground.swift mac/Canvas.swift mac/CompanionBubble.swift mac/ComputerActionApproval.swift mac/ScreenCapture.swift)
+          frameworks=(-framework AppKit -framework ApplicationServices -framework CoreGraphics -framework AVFoundation -framework ScreenCaptureKit -framework SwiftUI)
+          swiftc -swift-version 5 "${sources[@]}" mac/tests/main.swift "${frameworks[@]}" -o "$RUNNER_TEMP/aloy-check"
+          "$RUNNER_TEMP/aloy-check"
+          swiftc -swift-version 5 -parse-as-library "${sources[@]}" mac/tests/playground/main.swift "${frameworks[@]}" -o "$RUNNER_TEMP/playground-check"
+          "$RUNNER_TEMP/playground-check"
+          swiftc -swift-version 5 mac/Aloy.swift "${sources[@]}" "${frameworks[@]}" -o "$RUNNER_TEMP/Aloy"

@@ -78,6 +78,7 @@ def test_gemini_interactions_uses_selected_voice_and_one_dispatch(monkeypatch):
         payload = calls[1][1]
         assert payload["generation_config"]["speech_config"] == [{"voice": "Sulafat"}]
         assert payload["input"][0]["content"][0]["text"] == "Hallo Ayush."
+        assert "Ah-loy" in payload["input"][0]["content"][0]["annotations"][0]["style"]
         await synth.close()
 
     asyncio.run(scenario())

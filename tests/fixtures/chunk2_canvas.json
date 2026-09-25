@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "artifact_id": "synthetic-artifact",
+  "conversation_id": "synthetic-conversation",
+  "run_id": "synthetic-run",
+  "sequence": 1,
+  "created_at": "2026-09-25T12:00:00+00:00",
+  "title": "German word order",
+  "blocks": [
+    {"id": "heading", "kind": "heading", "text": "The verb holds its place."},
+    {"id": "text", "kind": "text", "text": "Change the beginning. The verb stays second."},
+    {"id": "sentence", "kind": "sentence", "source": "Heute lerne ich Deutsch.", "target": "Ich lerne heute Deutsch.", "explanation": "Same meaning, different emphasis."},
+    {"id": "choice", "kind": "choice", "prompt": "Which word is the verb?", "options": [{"id": "lerne", "label": "lerne"}, {"id": "heute", "label": "Heute"}], "correct_option_id": "lerne", "explanation": "Lerne describes the action."},
+    {"id": "table", "kind": "table", "columns": ["Position", "Word"], "rows": [["1", "Heute"], ["2", "lerne"]]},
+    {"id": "chart", "kind": "chart", "chart_kind": "bar", "title": "Synthetic practice counts", "labels": ["Monday", "Tuesday"], "series": [{"name": "Examples", "values": [2, 4]}]},
+    {"id": "drawing", "kind": "drawing", "strokes": [{"color": "#06A77D", "width": 2, "points": [{"x": 0.1, "y": 0.4}, {"x": 0.7, "y": 0.4}]}]}
+  ]
+}

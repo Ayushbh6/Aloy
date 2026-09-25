@@ -11,6 +11,8 @@ MONTHLY_WARNING_USD = 20.0
 # USD per million tokens. These are estimates, not provider invoices.
 RATES = {
     "deepseek/deepseek-v4.1-flash": (0.30, 1.20),
+    "z-ai/glm-5.3-flash": (0.15, 0.60),
+    "qwen/qwen3.8-omni-flash": (0.15, 0.47),
     "gemini-3.5-flash-lite": (0.30, 2.50),
     "gemini-3.8-flash": (0.75, 3.75),
 }

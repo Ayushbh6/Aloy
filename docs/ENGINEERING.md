@@ -12,10 +12,14 @@ external agent backend through its documented interface. Its internally managed 
 loop is not a reason to build a second Aloy loop or pretend to control steps we cannot
 observe. The adapter must advertise this difference and enforce our outer boundaries.
 
-## Canonical path in the first build
+## Canonical text path in Chunk 1
 
-Input validation -> context assembly -> provider invocation -> normalized events ->
-validated result -> persistence. Tool dispatch and continuation are deferred.
+Input validation -> bounded context assembly -> provider step -> validated tool
+execution -> provider continuation -> normalized events and durable persistence.
+`AgentRunner` owns this loop for all standard text providers. Codex uses the
+experimental app-server dynamic-tool callback, with its own shell/browser/MCP
+capabilities disabled. `ChatAgent` is only an API-compatible wrapper around
+`AgentRunner`, including cancellation; it has no separate execution logic.
 
 All text, image, voice transcript, scheduled wake and eventual child-agent entry points
 call the same runtime. Speech and UI subscribe to typed events. They never call an LLM
@@ -26,12 +30,36 @@ One response can carry speakable text and typed visual instructions. Playback an
 visuals share sequence identifiers and cancellation. No arbitrary model-generated
 JavaScript execution in the teaching UI.
 
-## Future public contracts (not implemented)
+## Contracts and remaining boundary
 
-AgentSpec: name, system_prompt, model, tools, mcp_servers, skills, output_format,
-max_turns, policy and budget. AgentInput: text, images, conversation reference and
-optional audio evidence. AgentResult: output, structured output, usage, stop reason,
-run reference. Separate reusable agent definition from per-run inputs.
+`AgentSpec`/`AgentInput`, `ProviderTurn`, `ToolSpec`/`ToolCall`/`ToolResult`, and
+`AgentEvent` cover the Chunk 1 runtime. `CONTEXT_TARGET_TOKENS=30_000` is central;
+the newest eight completed exchanges remain verbatim while older history is
+summarized and retrieved. SQLite is canonical; LanceDB is a rebuildable projection.
+No arbitrary generated UI is executed. Chunk 2 renders version-one, bounded native
+artifacts through `canvas.present`: heading, text, sentence, choice, table, chart
+and drawing. SQLite owns artifact identity, sequence and conversation/run linkage;
+model arguments cannot choose that metadata. Both Python and Swift verify the
+shared synthetic fixture in `tests/fixtures/chunk2_canvas.json`.
+
+The orb, current-exchange bubble, full app and desktop canvas share one native
+conversation model. A canvas interaction references its saved artifact and enters
+the same `AgentRunner`, with generated-content provenance and no capture, desktop
+action or memory-mutation authority. Closing a canvas is presentation state, not
+deletion of its saved conversation artifact.
+
+Desktop click/type/hide tools are disabled by default and require an explicitly
+enabled approval policy. Their broker persists a proposal, waits for a scoped
+one-shot decision, then requests native execution. Native target revalidation is
+mandatory; approval is not permission to act in another app, window or text field.
+There are no automatic side-effect retries, app-closing tools or arbitrary code
+renderers. Actual macOS permission/action behavior requires owner acceptance;
+offline fixtures must never click or type into working applications.
+
+The current requirement-by-requirement audit, verification evidence and manual
+acceptance checklist are in [CHUNK1_REVIEW.md](CHUNK1_REVIEW.md). Do not treat a
+native build or protocol fixture as proof of actual ScreenCaptureKit permission,
+window selection, recording indicator or physical keyboard behavior.
 
 Model capabilities explicitly cover images, audio, structured output, tools and
 streaming. Unsupported requests fail clearly. No silent image loss or model substitution.
@@ -43,7 +71,7 @@ hidden remote reasoning or tool steps.
 
 - Explicit run lifecycle, durable outcomes and structured errors.
 - Cancellation and deadlines propagate through provider, tool, speech and child work.
-- Retry transient safe operations within limits. Never replay a side effect blindly.
+- No automatic remote retries or provider fallbacks in the agent loop. Never replay a side effect blindly.
 - Validate every tool input and output and enforce permission before dispatch.
 - Memory records distinguish observed evidence, learner self-report and model inference.
 - Local raw evidence can support bounded retrieval; never resend unlimited full history.

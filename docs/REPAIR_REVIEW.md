@@ -1,5 +1,10 @@
 # First-build repair review
 
+For the newer uncommitted Agent/Memory/Perception foundation, see
+[Chunk 1 implementation audit](CHUNK1_REVIEW.md). It records current test evidence,
+the upstream maintenance-check blocker and outstanding manual capture acceptance.
+The first-build evidence below is historical for paths replaced by Chunk 1.
+
 This review supersedes the earlier implementation claims where they differ. The
 first build remains a manually activated companion, not the future hands-free tutor.
 

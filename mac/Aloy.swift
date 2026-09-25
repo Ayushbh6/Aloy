@@ -1,9 +1,12 @@
 import AppKit
 import AVFoundation
 import Carbon
+import Combine
+import SwiftUI
 
-final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDelegate,
-                           AVAudioPlayerDelegate, NSTextFieldDelegate {
+@MainActor
+final class AppController: NSObject, NSApplicationDelegate, @preconcurrency AVAudioRecorderDelegate,
+                           @preconcurrency AVAudioPlayerDelegate {
     private var hotKeys: [EventHotKeyRef] = []
     private var hotKeyHandler: EventHandlerRef?
     private var shortcutGestures: [UInt32: ShortcutGesture] = [:]
@@ -11,22 +14,29 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
     private var backendInput: FileHandle?
     private let backendWriteQueue = DispatchQueue(label: "Aloy.BackendWrites")
     private var orbWindow: NSWindow!
-    private var panel: NSWindow!
+    private var bubbleWindow: NSPanel!
+    private var playgroundWindow: NSWindow?
+    private var playgroundModel: PlaygroundModel!
+    private var canvasCoordinator: CanvasCoordinator!
+    private let actionApproval = ComputerActionApprovalCoordinator()
+    private var pendingActionExecution = PendingActionExecution()
+    private var actionExecutionWorkItem: DispatchWorkItem?
+    private var restoreBubbleAfterAction = false
+    private var modelObservation: AnyCancellable?
+    private var capturedTargetsByRun: [String: [CapturedTargetRecord]] = [:]
+    private var captureTask: Task<Void, Never>?
+    private var captureID: String?
+    private var enabledAgentTools: Set<String>?
+    private var screenCapture: ScreenCaptureCoordinator?
     private var orb: OrbView!
-    private var transcript: NSTextView!
-    private var entry: NSTextField!
-    private var status: NSTextField!
-    private var recordButton: NSButton!
-    private var stopButton: NSButton!
-    private var historyPicker: NSPopUpButton!
-    private var providerPicker: NSPopUpButton!
-    private var speechPicker: NSPopUpButton!
-    private var voicePicker: NSPopUpButton!
-    private var speechOptions: [[String: Any]] = []
-    private var savedVoices: [String: String] = [:]
-    private var modePicker: NSPopUpButton!
+    private let status = NSTextField(labelWithString: "Starting…")
+    private var currentProvider = "gemini"
+    private var currentSpeech = "chatterbox"
+    private var currentVoice = "warm-male"
+    private var currentMode = "standard"
     private var conversationID: String?
     private var dataRoot: String?
+    private var visionRoute = "gemini"
     private var recorder: AVAudioRecorder?
     private var voiceMonitor: AVAudioEngine?
     private var voiceMonitorID: String?
@@ -44,6 +54,11 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
     private var currentRunID: String?
     private var replyAudio = ReplyAudioState()
 
+    private struct CapturedTargetRecord {
+        let operationID: String
+        let target: CapturedWindowTarget
+    }
+
     private func updateReplyAppearance() {
         orb.isSpeaking = replyAudio.isSpeaking(
             hasPlayback: player?.isPlaying == true || !audioQueue.isEmpty)
@@ -51,10 +66,45 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        let menu = NSMenu()
+        let appItem = NSMenuItem()
+        let appMenu = NSMenu(title: "Aloy")
+        appMenu.addItem(withTitle: "Quit Aloy", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        appItem.submenu = appMenu
+        menu.addItem(appItem)
+        NSApp.mainMenu = menu
+        playgroundModel = makePlaygroundModel()
+        playgroundModel.onRecord = { [weak self] in self?.toggleRecording() }
+        playgroundModel.onStop = { [weak self] in self?.stopAction() }
+        playgroundModel.onReplayAudio = { [weak self] direction in
+            if direction == "input" { self?.replayInputAudio() }
+            else { self?.replayAudio() }
+        }
+        playgroundModel.onShowStorage = { [weak self] in self?.showStorage() }
+        canvasCoordinator = CanvasCoordinator(model: playgroundModel)
+        actionApproval.onDecision = { [weak self] proposal, decision in
+            self?.command("action_decision", ["proposal_id": proposal.proposalID,
+                "operation_id": proposal.operationID, "run_id": proposal.runID,
+                "decision": decision], version: 2, operationID: proposal.operationID)
+        }
         buildOrb()
-        buildPanel()
+        buildBubble()
+        screenCapture = ScreenCaptureCoordinator()
         startBackend()
         registerVoiceShortcut()
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        stopAction()
+        // EOF runs the bridge's normal cancellation, worker cleanup and DB close.
+        try? backendInput?.close()
+        backendInput = nil
+        guard let backend, backend.isRunning else { return .terminateNow }
+        DispatchQueue.global(qos: .utility).async {
+            backend.waitUntilExit()
+            DispatchQueue.main.async { sender.reply(toApplicationShouldTerminate: true) }
+        }
+        return .terminateLater
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -65,7 +115,7 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
         voiceMonitor?.stop()
         // Unfinished capture remains in Aloy/tmp for recovery on next launch.
         player?.stop()
-        backend?.terminate()
+        captureTask?.cancel()
     }
 
     private func registerVoiceShortcut() {
@@ -102,11 +152,10 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
         if failed {
             let alert = NSAlert()
             alert.messageText = "An Aloy shortcut is unavailable"
-            alert.informativeText = "Option–Z records/sends; Option–X cancels. Another app may own a shortcut. The panel buttons still work."
+            alert.informativeText = "Option–Z records/sends; Option–X cancels. Another app may own a shortcut. Open Aloy to use the conversation controls."
             alert.runModal()
         }
         orb.toolTip = "Option–Z: record/send · Option–X: cancel · Click for chat"
-        recordButton.toolTip = "Option–Z works from other apps too"
     }
 
     private func label(_ title: String, frame: NSRect, size: CGFloat = 12,
@@ -136,109 +185,79 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
         orbWindow.hasShadow = false
         orb = OrbView(frame: NSRect(x: 0, y: 0, width: 56, height: 56))
         orb.onClick = { [weak self] in self?.togglePanel() }
+        orb.onMove = { [weak self] _ in
+            guard let self, self.bubbleWindow?.isVisible == true else { return }
+            self.placeBubble()
+        }
         orbWindow.contentView = orb
         orbWindow.orderFrontRegardless()
     }
 
-    private func buildPanel() {
-        let rect = NSRect(x: orbWindow.frame.minX - 418, y: orbWindow.frame.minY - 470,
-                          width: 400, height: 525)
-        panel = NSWindow(contentRect: rect, styleMask: [.titled, .closable, .resizable],
-                         backing: .buffered, defer: false)
-        panel.isReleasedWhenClosed = false
-        panel.title = "Aloy"
-        panel.level = .floating
-        panel.minSize = NSSize(width: 380, height: 500)
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-        let canvas = NSView(frame: NSRect(origin: .zero, size: rect.size))
-        canvas.wantsLayer = true
-        canvas.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
-        panel.contentView = canvas
+    private func buildBubble() {
+        let size = CGSize(width: 360, height: 260)
+        let screen = visibleScreen(for: orbWindow.frame)
+        let frame = CompanionBubblePlacement.frame(orb: orbWindow.frame,
+                                                   visibleScreen: screen, size: size)
+        bubbleWindow = NSPanel(contentRect: frame,
+                               styleMask: [.borderless, .nonactivatingPanel],
+                               backing: .buffered, defer: false)
+        bubbleWindow.isReleasedWhenClosed = false
+        bubbleWindow.level = .floating
+        bubbleWindow.isOpaque = false
+        bubbleWindow.backgroundColor = .clear
+        bubbleWindow.hasShadow = false
+        bubbleWindow.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        bubbleWindow.contentView = NSHostingView(rootView: CompanionBubbleView(
+            model: playgroundModel,
+            onExpand: { [weak self] in self?.openPlayground() },
+            onDismiss: { [weak self] in self?.hideBubble() }))
+        modelObservation = playgroundModel.objectWillChange.sink { [weak self] _ in
+            DispatchQueue.main.async { self?.resizeBubbleToFit() }
+        }
+    }
 
-        canvas.addSubview(label("Aloy", frame: NSRect(x: 20, y: 480, width: 120, height: 28),
-                                size: 22, weight: .semibold))
-        status = label("Starting…", frame: NSRect(x: 20, y: 456, width: 355, height: 18))
-        canvas.addSubview(status)
+    private func visibleScreen(for rect: NSRect) -> NSRect {
+        NSScreen.screens.first(where: { $0.frame.intersects(rect) })?.visibleFrame
+            ?? NSScreen.main?.visibleFrame
+            ?? NSRect(x: 0, y: 0, width: 1200, height: 800)
+    }
 
-        historyPicker = NSPopUpButton(frame: NSRect(x: 20, y: 421, width: 260, height: 28))
-        historyPicker.target = self
-        historyPicker.action = #selector(selectConversation)
-        canvas.addSubview(historyPicker)
-        canvas.addSubview(button("New", frame: NSRect(x: 290, y: 421, width: 82, height: 28),
-                                 action: #selector(newConversation)))
+    private func placeBubble() {
+        guard bubbleWindow != nil else { return }
+        let screen = visibleScreen(for: orbWindow.frame)
+        let frame = CompanionBubblePlacement.frame(orb: orbWindow.frame,
+                                                   visibleScreen: screen,
+                                                   size: bubbleWindow.frame.size)
+        bubbleWindow.setFrame(frame, display: true)
+    }
 
-        let scroll = NSScrollView(frame: NSRect(x: 20, y: 203, width: 352, height: 206))
-        scroll.hasVerticalScroller = true
-        scroll.borderType = .noBorder
-        transcript = NSTextView(frame: scroll.bounds)
-        transcript.isEditable = false
-        transcript.isSelectable = true
-        transcript.drawsBackground = false
-        transcript.font = .systemFont(ofSize: 14)
-        transcript.textContainerInset = NSSize(width: 6, height: 8)
-        scroll.documentView = transcript
-        canvas.addSubview(scroll)
+    private func resizeBubbleToFit() {
+        guard let hosting = bubbleWindow?.contentView as? NSHostingView<CompanionBubbleView> else { return }
+        let fitted = hosting.fittingSize
+        let screen = visibleScreen(for: orbWindow.frame)
+        let height = min(max(fitted.height, 210), max(210, screen.height - 16))
+        bubbleWindow.setContentSize(NSSize(width: 360, height: height))
+        placeBubble()
+    }
 
-        entry = NSTextField(frame: NSRect(x: 20, y: 164, width: 270, height: 29))
-        entry.placeholderString = "Talk to Aloy…"
-        entry.delegate = self
-        canvas.addSubview(entry)
-        canvas.addSubview(button("Send", frame: NSRect(x: 299, y: 164, width: 73, height: 29),
-                                 action: #selector(sendText)))
-        recordButton = button("Record", frame: NSRect(x: 20, y: 127, width: 166, height: 29),
-                              action: #selector(toggleRecording))
-        canvas.addSubview(recordButton)
-        stopButton = button("Stop", frame: NSRect(x: 195, y: 127, width: 177, height: 29),
-                            action: #selector(stopAction))
-        canvas.addSubview(stopButton)
-        let replayButton = button("Replay", frame: NSRect(x: 20, y: 91, width: 108, height: 29),
-                                  action: #selector(replayAudio))
-        replayButton.toolTip = "Replay the last reply. Right-click to replay your last recording."
-        let replayMenu = NSMenu()
-        let replayInput = NSMenuItem(title: "Replay last recording", action: #selector(replayInputAudio), keyEquivalent: "")
-        replayInput.target = self
-        replayMenu.addItem(replayInput)
-        replayButton.menu = replayMenu
-        canvas.addSubview(replayButton)
-        canvas.addSubview(button("Storage", frame: NSRect(x: 142, y: 91, width: 108, height: 29),
-                                 action: #selector(showStorage)))
-        canvas.addSubview(button("Delete", frame: NSRect(x: 264, y: 91, width: 108, height: 29),
-                                 action: #selector(deleteConversation)))
+    private func showBubble() {
+        resizeBubbleToFit()
+        bubbleWindow.alphaValue = 0
+        bubbleWindow.orderFrontRegardless()
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.18
+            bubbleWindow.animator().alphaValue = 1
+        }
+    }
 
-        providerPicker = NSPopUpButton(frame: NSRect(x: 20, y: 24, width: 115, height: 28))
-        providerPicker.addItems(withTitles: ["Gemini Lite", "OpenRouter", "Gemini Flash", "Codex", "Fake"])
-        providerPicker.target = self
-        providerPicker.action = #selector(settingsChanged)
-        canvas.addSubview(providerPicker)
-        speechPicker = NSPopUpButton(frame: NSRect(x: 141, y: 24, width: 125, height: 28))
-        speechPicker.addItem(withTitle: "Loading voices…")
-        speechPicker.isEnabled = false
-        speechPicker.target = self
-        speechPicker.action = #selector(settingsChanged)
-        canvas.addSubview(speechPicker)
-        canvas.addSubview(label("Voice", frame: NSRect(x: 22, y: 59, width: 42, height: 20),
-                                size: 11, weight: .medium))
-        voicePicker = NSPopUpButton(frame: NSRect(x: 65, y: 55, width: 307, height: 28))
-        voicePicker.isEnabled = false
-        voicePicker.target = self
-        voicePicker.action = #selector(settingsChanged)
-        canvas.addSubview(voicePicker)
-        modePicker = NSPopUpButton(frame: NSRect(x: 272, y: 24, width: 100, height: 28))
-        modePicker.addItems(withTitles: ["Standard", "Live audio"])
-        modePicker.target = self
-        modePicker.action = #selector(settingsChanged)
-        canvas.addSubview(modePicker)
+    private func hideBubble() {
+        guard bubbleWindow?.isVisible == true else { return }
+        bubbleWindow.orderOut(nil)
     }
 
     private func togglePanel() {
-        if panel.isVisible { panel.orderOut(nil) }
-        else {
-            let frame = orbWindow.frame
-            panel.setFrameOrigin(NSPoint(x: frame.minX - panel.frame.width - 12,
-                                         y: max(50, frame.midY - panel.frame.height / 2)))
-            panel.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
-        }
+        if bubbleWindow.isVisible { hideBubble() }
+        else { showBubble() }
     }
 
     private func startBackend() {
@@ -288,10 +307,11 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
         }
     }
 
-    private func command(_ action: String, _ fields: [String: Any] = [:]) {
+    private func command(_ action: String, _ fields: [String: Any] = [:], version: Int = 1,
+                         operationID: String? = nil) {
         var object = fields
-        object["v"] = 1
-        object["operation_id"] = operation.id
+        object["v"] = version
+        object["operation_id"] = operationID ?? operation.id
         object["action"] = action
         object["id"] = UUID().uuidString
         guard let data = try? JSONSerialization.data(withJSONObject: object),
@@ -300,63 +320,78 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
         backendWriteQueue.async { input.write(packet) }
     }
 
-    private func append(_ text: String) {
-        transcript.string += text
-        transcript.scrollToEndOfDocument(nil)
-    }
-
     private func handle(_ object: [String: Any]) {
         guard let event = object["event"] as? String else { return }
         if let id = object["operation_id"] as? String, !operation.accepts(id) { return }
+        playgroundModel.receive(object)
+        if let request = actionPayload(object, kind: "action_requested") {
+            handleActionRequest(request)
+            return
+        }
+        if let execution = actionPayload(object, kind: "action_execute") {
+            handleActionExecution(execution)
+            return
+        }
+        if let cancellation = actionPayload(object, kind: "action_cancelled") {
+            actionApproval.handleCancellation(cancellation)
+            cancelScheduledActionExecution(
+                proposalID: cancellation["proposal_id"] as? String, report: false)
+            return
+        }
         switch event {
+        case "capture_cancelled":
+            if object["capture_id"] as? String == captureID { captureTask?.cancel() }
+        case "capture_requested":
+            guard let captureID = object["capture_id"] as? String,
+                  let kind = object["kind"] as? String,
+                  let seconds = object["seconds"] as? Int,
+                  let runID = object["run_id"] as? String,
+                  let root = dataRoot, let screenCapture else { return }
+            let operationID = object["operation_id"] as? String ?? operation.id
+            let previousCapture = captureTask
+            previousCapture?.cancel()
+            self.captureID = captureID
+            captureTask = Task { [weak self] in
+                guard let self else { return }
+                do {
+                    await previousCapture?.value
+                    try Task.checkCancellation()
+                    let captured = try await screenCapture.capture(kind: kind, seconds: seconds,
+                                                                  root: root)
+                    try Task.checkCancellation()
+                    self.capturedTargetsByRun[runID, default: []].append(
+                        CapturedTargetRecord(operationID: operationID, target: captured.target))
+                    self.command("capture_result", ["capture_id": captureID,
+                        "path": captured.path, "target": captured.target.bridgeValue],
+                        version: 2, operationID: operationID)
+                } catch {
+                    self.command("capture_result", ["capture_id": captureID,
+                        "error": error.localizedDescription], version: 2, operationID: operationID)
+                }
+            }
         case "ready":
             dataRoot = object["root"] as? String
             let settings = object["settings"] as? [String: String] ?? [:]
-            speechOptions = object["speech_options"] as? [[String: Any]] ?? []
-            savedVoices = settings.filter { $0.key.hasPrefix("voice:") }
-            speechPicker.removeAllItems()
-            for option in speechOptions {
-                guard let id = option["id"] as? String,
-                      let title = option["title"] as? String else { continue }
-                speechPicker.addItem(withTitle: title)
-                speechPicker.lastItem?.representedObject = id
-                speechPicker.lastItem?.toolTip = option["detail"] as? String
+            currentProvider = settings["provider"] ?? currentProvider
+            currentSpeech = settings["speech"] ?? currentSpeech
+            currentVoice = settings["voice:\(currentSpeech)"] ?? currentVoice
+            currentMode = settings["mode"] ?? currentMode
+            if let encoded = settings["tools"]?.data(using: .utf8),
+               let tools = try? JSONSerialization.jsonObject(with: encoded) as? [String] {
+                enabledAgentTools = Set(tools)
             }
-            speechPicker.isEnabled = speechPicker.numberOfItems > 0
-            if let provider = settings["provider"],
-               let index = ["gemini", "openrouter", "gemini-quality", "codex", "fake"].firstIndex(of: provider) {
-                providerPicker.selectItem(at: index)
-            }
-            if let speech = settings["speech"],
-               let item = speechPicker.itemArray.first(where: { $0.representedObject as? String == speech }) {
-                speechPicker.select(item)
-            }
-            refreshVoices()
-            if settings["mode"] == "live" { modePicker.selectItem(at: 1) }
             status.stringValue = "Ready"
+            playgroundModel.companionStatus = .ready
             command("list")
         case "conversations":
             let items = object["items"] as? [[String: Any]] ?? []
-            historyPicker.removeAllItems()
-            for item in items {
-                historyPicker.addItem(withTitle: item["title"] as? String ?? "Conversation")
-                historyPicker.lastItem?.representedObject = item["id"]
-            }
+            if let id = conversationID, items.contains(where: { $0["id"] as? String == id }) { break }
             if let first = items.first, let id = first["id"] as? String {
                 command("select", ["conversation_id": id])
             } else { command("new") }
         case "conversation":
             conversationID = object["conversation_id"] as? String
-            if let id = conversationID {
-                if !historyPicker.itemArray.contains(where: { $0.representedObject as? String == id }) {
-                    historyPicker.addItem(withTitle: "New conversation")
-                    historyPicker.lastItem?.representedObject = id
-                }
-                if let index = historyPicker.itemArray.firstIndex(where: {
-                    $0.representedObject as? String == id
-                }) { historyPicker.selectItem(at: index) }
-            }
-            transcript.string = ""
+            capturedTargetsByRun.removeAll()
             lastAudioPath = (object["audio"] as? [[String: Any]])?.last(where: {
                 $0["direction"] as? String == "output"
             })?["path"] as? String
@@ -373,13 +408,6 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
             lastAudioAssetID = (object["audio"] as? [[String: Any]])?.last(where: {
                 $0["direction"] as? String == "output"
             })?["id"] as? String
-            for item in object["messages"] as? [[String: Any]] ?? [] {
-                let role = item["role"] as? String == "user" ? "You" : "Aloy"
-                let body = item["text"] as? String ?? ""
-                let completion = item["status"] as? String ?? "complete"
-                let marker = completion == "complete" ? "" : " [\(completion)]"
-                append("\(role)\(marker): \(body)\n\n")
-            }
         case "started":
             replyAudio.begin()
             orb.isProcessing = true
@@ -388,26 +416,25 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
             currentRunID = object["run_id"] as? String
             replyBuffer = ""
             status.stringValue = "Thinking…"
-            append("Aloy: ")
+            playgroundModel.companionStatus = .thinking
         case "live_processing":
             status.stringValue = "Listening and responding…"
         case "delta":
             guard object["run_id"] as? String == currentRunID else { return }
-            let text = object["text"] as? String ?? ""
-            replyBuffer += text
-            append(text)
+            replyBuffer += object["text"] as? String ?? ""
         case "completed":
-            append("\n\n")
             status.stringValue = "Speaking…"
             if object["budget_warning"] as? Bool == true { status.stringValue = "Spending warning: $20+" }
         case "transcript":
-            append("You: \(object["text"] as? String ?? "")\n\n")
             status.stringValue = "Thinking…"
+            playgroundModel.companionStatus = .thinking
         case "speech_activity":
             guard recorder != nil, object["session_id"] as? String == voiceMonitorID else { return }
             status.stringValue = object["state"] as? String == "speech"
                 ? "Hearing you…"
                 : "Paused — keep speaking, or Option–Z to send"
+            playgroundModel.companionStatus = object["state"] as? String == "speech"
+                ? .listening : .recording
         case "audio":
             if let path = object["path"] as? String, let id = object["asset_id"] as? String {
                 replyAudio.audioArrived()
@@ -417,28 +444,31 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
                 audioQueue.append((path, id))
                 playNext()
                 updateReplyAppearance()
+                playgroundModel.companionStatus = .speaking
             }
         case "turn_done":
             replyAudio.finishGeneration()
             orb.isProcessing = false
             updateReplyAppearance()
+            if object["failed"] as? Bool == true {
+                playgroundModel.companionStatus = .error
+            } else if orb.isSpeaking {
+                playgroundModel.companionStatus = .speaking
+            } else {
+                playgroundModel.companionStatus = .ready
+            }
             if !orb.isSpeaking && object["failed"] as? Bool != true {
                 status.stringValue = "Ready"
             }
+            if let currentRunID { capturedTargetsByRun.removeValue(forKey: currentRunID) }
+            currentRunID = nil
             command("list")
         case "recording_retained":
             status.stringValue = "Saved locally. Right-click Replay to hear it. Not sent."
+            playgroundModel.companionStatus = .ready
             if let id = conversationID { command("select", ["conversation_id": id]) }
         case "storage":
-            let bytes = object["bytes"] as? Int ?? 0
-            let spend = object["spend_usd"] as? Double ?? 0
-            let alert = NSAlert()
-            alert.messageText = "Aloy storage"
-            alert.informativeText = String(format: "%.1f MB locally · $%.4f estimated this month",
-                                           Double(bytes) / 1_000_000, spend)
-            let orphans = object["retained_orphans"] as? Int ?? 0
-            if orphans > 0 { alert.informativeText += " · \(orphans) recovered files retained" }
-            alert.runModal()
+            break
         case "deleted":
             command("list")
         case "no_speech":
@@ -446,18 +476,165 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
             orb.isProcessing = false
             status.stringValue = "No speech detected — nothing sent"
             orb.toolTip = status.stringValue
+            playgroundModel.companionStatus = .ready
         case "error", "speech_error":
             orb.hasError = true
             orb.isProcessing = false
             stopPlayback()
             status.stringValue = object["error"] as? String ?? "Error"
+            playgroundModel.status = status.stringValue
+            playgroundModel.companionStatus = .error
         case "stopped":
             replyAudio.reset()
             orb.isProcessing = false
             updateReplyAppearance()
+            playgroundModel.companionStatus = .ready
             if recorder == nil { status.stringValue = "Ready" }
+            capturedTargetsByRun.removeAll()
         default: break
         }
+    }
+
+    private func actionPayload(_ object: [String: Any], kind: String) -> [String: Any]? {
+        if object["event"] as? String == kind { return object }
+        guard object["event"] as? String == "agent_event",
+              object["agent_kind"] as? String == kind,
+              var payload = object["data"] as? [String: Any] else { return nil }
+        payload["event"] = kind
+        payload["operation_id"] = object["operation_id"] ?? payload["operation_id"]
+        payload["run_id"] = object["run_id"] ?? payload["run_id"]
+        return payload
+    }
+
+    private func handleActionRequest(_ payload: [String: Any]) {
+        guard let proposalID = payload["proposal_id"] as? String,
+              let operationID = payload["operation_id"] as? String,
+              let runID = payload["run_id"] as? String else { return }
+        let action = payload["action"] as? String ?? ""
+        guard playgroundModel.agentPolicy == "approval_required",
+              playgroundModel.enabledTools.contains(action) else {
+            showNativeError("Desktop actions are disabled. Enable the tool and choose approval-required policy in Settings.")
+            command("action_decision", ["proposal_id": proposalID, "operation_id": operationID,
+                "run_id": runID, "decision": "deny"], version: 2, operationID: operationID)
+            return
+        }
+        guard runID == currentRunID, operation.accepts(operationID),
+              let records = capturedTargetsByRun[runID],
+              let record = records.last(where: { $0.operationID == operationID }) else {
+            showNativeError("A desktop action needs a successful screen capture in this run to identify its exact target. Capture metadata is not approval.")
+            command("action_decision", ["proposal_id": proposalID, "operation_id": operationID,
+                "run_id": runID, "decision": "deny"], version: 2, operationID: operationID)
+            return
+        }
+        guard let proposal = ComputerActionProposal.decode(payload, capturedTarget: record.target) else {
+            showNativeError("Aloy refused a malformed, expired, or unsupported desktop action.")
+            command("action_decision", ["proposal_id": proposalID, "operation_id": operationID,
+                "run_id": runID, "decision": "deny"], version: 2, operationID: operationID)
+            return
+        }
+        actionApproval.present(proposal)
+    }
+
+    private func showNativeError(_ message: String) {
+        status.stringValue = message
+        playgroundModel.status = message
+        playgroundModel.companionStatus = .error
+    }
+
+    private func handleActionExecution(_ payload: [String: Any]) {
+        guard let proposalID = payload["proposal_id"] as? String,
+              let operationID = payload["operation_id"] as? String,
+              let runID = payload["run_id"] as? String else { return }
+        guard let proposal = actionApproval.takeApproved(for: payload),
+              playgroundModel.agentPolicy == "approval_required",
+              playgroundModel.enabledTools.contains(proposal.kind.rawValue),
+              operation.accepts(operationID), currentRunID == runID,
+              capturedTargetsByRun[runID]?.contains(where: {
+                  $0.operationID == operationID && $0.target.bundleID == proposal.bundleID &&
+                      $0.target.windowID == proposal.windowID && $0.target.processID == proposal.processID
+              }) == true else {
+            sendActionResult(proposalID: proposalID, operationID: operationID, runID: runID,
+                             status: "stale", result: ["reason": "No matching live approval."])
+            return
+        }
+        guard pendingActionExecution.schedule(proposal, operationGateID: operation.id) != nil else {
+            sendActionResult(proposalID: proposalID, operationID: operationID, runID: runID,
+                             status: "stale", result: ["reason": "Another approved action is already queued."])
+            return
+        }
+        restoreBubbleAfterAction = bubbleWindow?.isVisible == true
+        hideBubble()
+        orbWindow.orderOut(nil)
+        canvasCoordinator.hideTemporarily()
+        guard ComputerActionExecution.prepareFocus(proposal) else {
+            _ = pendingActionExecution.cancel(proposalID: proposalID)
+            sendActionResult(proposalID: proposalID, operationID: operationID, runID: runID,
+                             status: "stale", result: ["reason": "The exact approved window could not be focused."])
+            restoreActionPresentation()
+            return
+        }
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.actionExecutionWorkItem = nil
+            guard self.playgroundModel.agentPolicy == "approval_required",
+                  self.playgroundModel.enabledTools.contains(proposal.kind.rawValue) else {
+                _ = self.pendingActionExecution.cancel(proposalID: proposalID)
+                self.sendActionResult(proposalID: proposalID, operationID: operationID,
+                                      runID: runID, status: "cancelled",
+                                      result: ["reason": "Desktop permission was disabled."])
+                self.restoreActionPresentation()
+                return
+            }
+            guard self.pendingActionExecution.consume(proposalID: proposalID,
+                    operationID: operationID, runID: runID, operationGateID: self.operation.id,
+                    currentRunID: self.currentRunID) else {
+                self.sendActionResult(proposalID: proposalID, operationID: operationID,
+                                      runID: runID, status: "stale",
+                                      result: ["reason": "The approved action is no longer current."])
+                self.restoreActionPresentation()
+                return
+            }
+            switch ComputerActionExecution.perform(proposal) {
+            case .completed(let result):
+                self.sendActionResult(proposalID: proposalID, operationID: operationID,
+                                      runID: runID, status: "completed", result: result)
+            case .stale(let reason):
+                self.sendActionResult(proposalID: proposalID, operationID: operationID,
+                                      runID: runID, status: "stale", result: ["reason": reason])
+            case .failed(let reason):
+                self.sendActionResult(proposalID: proposalID, operationID: operationID,
+                                      runID: runID, status: "failed", result: ["reason": reason])
+            }
+            self.restoreActionPresentation()
+        }
+        actionExecutionWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: workItem)
+    }
+
+    private func cancelScheduledActionExecution(proposalID: String? = nil, report: Bool) {
+        guard let ticket = pendingActionExecution.cancel(proposalID: proposalID) else { return }
+        actionExecutionWorkItem?.cancel()
+        actionExecutionWorkItem = nil
+        if report {
+            sendActionResult(proposalID: ticket.proposalID, operationID: ticket.operationID,
+                             runID: ticket.runID, status: "cancelled",
+                             result: ["reason": "Cancelled before the approved action ran."])
+        }
+        restoreActionPresentation()
+    }
+
+    private func restoreActionPresentation() {
+        orbWindow?.orderFrontRegardless()
+        canvasCoordinator?.restoreIfPresented()
+        if restoreBubbleAfterAction { showBubble() }
+        restoreBubbleAfterAction = false
+    }
+
+    private func sendActionResult(proposalID: String, operationID: String, runID: String,
+                                  status: String, result: [String: Any]) {
+        command("action_result", ["proposal_id": proposalID, "operation_id": operationID,
+            "run_id": runID, "status": status, "result": result],
+            version: 2, operationID: operationID)
     }
 
     private func playNext() {
@@ -488,9 +665,14 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
         if !flag {
             replyAudio.reset()
             status.stringValue = "Audio playback stopped unexpectedly"
+            playgroundModel.status = status.stringValue
+            playgroundModel.companionStatus = .error
         }
         else if !audioQueue.isEmpty { playNext() }
-        else { status.stringValue = replyAudio.generationComplete ? "Ready" : "Speaking…" }
+        else {
+            status.stringValue = replyAudio.generationComplete ? "Ready" : "Speaking…"
+            playgroundModel.companionStatus = replyAudio.generationComplete ? .ready : .speaking
+        }
         updateReplyAppearance()
     }
 
@@ -504,6 +686,7 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
         replyAudio.reset()
         updateReplyAppearance()
         orb.isProcessing = false
+        if recorder == nil { playgroundModel.companionStatus = .ready }
         let elapsed = (ProcessInfo.processInfo.systemUptime - began) * 1000
         if let id = playingAssetID { command("playback", ["asset_id": id, "status": "cancelled"]) }
         playingAssetID = nil
@@ -512,59 +695,13 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
     }
 
     private var provider: String {
-        ["gemini", "openrouter", "gemini-quality", "codex", "fake"][providerPicker.indexOfSelectedItem]
+        currentProvider
     }
     private var speech: String {
-        speechPicker.selectedItem?.representedObject as? String ?? "chatterbox"
+        currentSpeech
     }
     private var voice: String {
-        voicePicker.selectedItem?.representedObject as? String ?? "warm-male"
-    }
-
-    private func refreshVoices() {
-        voicePicker.removeAllItems()
-        guard let option = speechOptions.first(where: { $0["id"] as? String == speech }) else { return }
-        for choice in option["voices"] as? [[String: String]] ?? [] {
-            guard let id = choice["id"], let title = choice["title"] else { continue }
-            voicePicker.addItem(withTitle: title)
-            voicePicker.lastItem?.representedObject = id
-        }
-        let selected = savedVoices["voice:\(speech)"] ?? option["default_voice"] as? String
-        if let item = voicePicker.itemArray.first(where: { $0.representedObject as? String == selected }) {
-            voicePicker.select(item)
-        }
-        voicePicker.isEnabled = voicePicker.numberOfItems > 0
-    }
-
-    @objc private func settingsChanged(_ sender: NSPopUpButton) {
-        stopAction()
-        if sender === speechPicker {
-            refreshVoices()
-            command("set_setting", ["key": "speech", "value": speech])
-        } else if sender === voicePicker {
-            savedVoices["voice:\(speech)"] = voice
-            command("set_setting", ["key": "voice:\(speech)", "value": voice])
-        } else if sender === providerPicker {
-            command("set_setting", ["key": "provider", "value": provider])
-        } else {
-            command("set_setting", ["key": "mode",
-                                    "value": modePicker.indexOfSelectedItem == 1 ? "live" : "standard"])
-        }
-    }
-
-    @objc private func sendText() {
-        guard let id = conversationID, !entry.stringValue.trimmingCharacters(in: .whitespaces).isEmpty else { return }
-        if modePicker.indexOfSelectedItem == 1 {
-            status.stringValue = "Live audio uses Record"
-            return
-        }
-        operation.invalidate()
-        let text = entry.stringValue
-        entry.stringValue = ""
-        stopPlayback()
-        append("You: \(text)\n\n")
-        command("send", ["conversation_id": id, "text": text,
-                         "provider": provider, "speech": speech, "voice": voice])
+        playgroundModel?.speechVoice ?? currentVoice
     }
 
     @objc private func toggleRecording() {
@@ -575,21 +712,27 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
             startRecording()
         case .notDetermined:
             microphoneRequestPending = true
-            recordButton.isEnabled = false
             status.stringValue = "Waiting for microphone permission…"
             AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
                 DispatchQueue.main.async {
                     guard let self, self.microphoneRequestPending else { return }
                     self.microphoneRequestPending = false
-                    self.recordButton.isEnabled = true
                     if granted { self.startRecording() }
-                    else { self.status.stringValue = "Microphone access was not granted" }
+                    else {
+                        self.status.stringValue = "Microphone access was not granted"
+                        self.playgroundModel.status = self.status.stringValue
+                        self.playgroundModel.companionStatus = .error
+                    }
                 }
             }
         case .denied, .restricted:
             status.stringValue = "Enable Aloy microphone access in System Settings"
+            playgroundModel.status = status.stringValue
+            playgroundModel.companionStatus = .error
         @unknown default:
             status.stringValue = "Microphone permission unavailable"
+            playgroundModel.status = status.stringValue
+            playgroundModel.companionStatus = .error
         }
     }
 
@@ -600,15 +743,14 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
         orb.isRecording = false
         orb.toolTip = "Processing — Option–Z to start a new recording"
         previous?.stop()
-        recordButton.title = "Record"
-        stopButton.title = "Stop"
         guard let id = conversationID, let path = recordedPath else { return }
         recordedPath = nil
         command("recorded", ["conversation_id": id, "path": path,
                              "provider": provider, "speech": speech, "voice": voice,
-                             "mode": modePicker.indexOfSelectedItem == 1 ? "live" : "standard"])
+                             "mode": currentMode])
         orb.isProcessing = true
         status.stringValue = "Processing recording…"
+        playgroundModel.companionStatus = .thinking
     }
 
     func audioRecorderDidFinishRecording(_ recorder: AVAudioRecorder, successfully flag: Bool) {
@@ -620,7 +762,7 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
     private func startRecording() {
         guard let root = dataRoot, conversationID != nil else { return }
         orb.hasError = false
-        operation.invalidate()
+        invalidateOperation()
         stopPlayback()
         command("stop")
         let folder = URL(fileURLWithPath: root).appendingPathComponent("tmp")
@@ -642,10 +784,9 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
             orb.isRecording = true
             orb.toolTip = "Recording — Option–Z sends · Option–X cancels"
             recordedPath = url.path
-            recordButton.title = "Finish & Send"
             status.stringValue = "Recording… Finish & Send, or Cancel recording"
-            stopButton.title = "Cancel recording"
-            if modePicker.indexOfSelectedItem == 0 {
+            playgroundModel.companionStatus = .recording
+            if currentMode != "live" {
                 command("prewarm_speech", ["speech": speech, "voice": voice])
                 startVoiceMonitor()
             }
@@ -705,13 +846,12 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
     }
 
     @objc private func stopAction() {
+        captureTask?.cancel()
         stopVoiceMonitor()
+        invalidateOperation()
         orb.hasError = false
         orb.isProcessing = false
-        operation.invalidate()
-        currentRunID = nil
         microphoneRequestPending = false
-        recordButton.isEnabled = true
         let duration = recorder?.currentTime ?? 0
         let previousRecorder = recorder
         recorder = nil
@@ -719,27 +859,82 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
         previousRecorder?.stop()
         let cancelledPath = recordedPath
         recordedPath = nil
-        recordButton.title = "Record"
-        stopButton.title = "Stop"
         stopPlayback()
         command("stop")
         status.stringValue = "Stopped"
+        playgroundModel.companionStatus = .ready
         if let path = cancelledPath, let id = conversationID {
             command("cancel_recording", ["conversation_id": id, "path": path, "duration": duration])
         }
     }
 
-    @objc private func newConversation() {
-        stopAction()
-        command("new")
+    private func invalidateOperation() {
+        cancelScheduledActionExecution(report: true)
+        actionApproval.cancelPending()
+        actionApproval.clear()
+        operation.invalidate()
+        capturedTargetsByRun.removeAll()
+        currentRunID = nil
     }
-    @objc private func selectConversation() {
-        if let id = historyPicker.selectedItem?.representedObject as? String {
-            stopAction()
-            command("select", ["conversation_id": id])
+
+    private func makePlaygroundModel() -> PlaygroundModel {
+        PlaygroundModel { [weak self] action, fields in
+            self?.handlePlaygroundCommand(action, fields)
         }
     }
-    @objc private func showStorage() { command("storage") }
+
+    private func handlePlaygroundCommand(_ action: String, _ fields: [String: Any]) {
+        guard action != "stop" else { stopAction(); return }
+        if ["new", "select", "delete", "send", "canvas_interact", "set_setting"].contains(action) {
+            captureTask?.cancel()
+            stopAction()
+            stopPlayback()
+        }
+        currentProvider = playgroundModel.provider
+        currentSpeech = playgroundModel.speechEngine
+        currentVoice = playgroundModel.speechVoice
+        currentMode = playgroundModel.mode
+        if action == "set_setting", let key = fields["key"] as? String,
+           let value = fields["value"] as? String {
+            if key == "provider" { currentProvider = value }
+            else if key == "speech" { currentSpeech = value; currentVoice = playgroundModel.speechVoice }
+            else if key == "mode" { currentMode = value }
+            else if key.hasPrefix("voice:") && key == "voice:\(currentSpeech)" { currentVoice = value }
+            else if key == "tools", let data = value.data(using: .utf8),
+                    let tools = try? JSONSerialization.jsonObject(with: data) as? [String] {
+                enabledAgentTools = Set(tools)
+            }
+        }
+        command(action, fields, version: 2)
+    }
+
+    @objc private func openPlayground() {
+        hideBubble()
+        if let playgroundWindow {
+            playgroundWindow.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+        let frame = NSRect(x: 0, y: 0, width: 1120, height: 740)
+        let window = NSWindow(contentRect: frame,
+                              styleMask: [.titled, .closable, .resizable, .miniaturizable],
+                              backing: .buffered, defer: false)
+        window.title = "Aloy"
+        window.minSize = NSSize(width: 900, height: 600)
+        window.contentView = NSHostingView(rootView: AgentPlayground(model: playgroundModel))
+        window.center()
+        window.isReleasedWhenClosed = false
+        window.makeKeyAndOrderFront(nil)
+        playgroundWindow = window
+        NSApp.activate(ignoringOtherApps: true)
+        command("list", version: 2)
+        command("memory_list", version: 2)
+        if let conversationID {
+            command("inspect_conversation", ["conversation_id": conversationID], version: 2)
+        }
+    }
+
+    @objc private func showStorage() { command("storage", version: 2) }
     @objc private func replayAudio() {
         guard !replayAssets.isEmpty else { status.stringValue = "No audio to replay"; return }
         stopPlayback()
@@ -757,23 +952,6 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
         playNext()
     }
 
-    @objc private func deleteConversation() {
-        guard let id = conversationID else { return }
-        let alert = NSAlert()
-        alert.messageText = "Delete this conversation and its recordings?"
-        alert.addButton(withTitle: "Delete")
-        alert.addButton(withTitle: "Cancel")
-        if alert.runModal() == .alertFirstButtonReturn {
-            stopAction()
-            command("delete", ["conversation_id": id])
-            conversationID = nil
-            transcript.string = ""
-        }
-    }
-    func controlTextDidEndEditing(_ notification: Notification) {
-        if let text = notification.userInfo?["NSTextMovement"] as? Int,
-           text == NSReturnTextMovement { sendText() }
-    }
 }
 
 @main

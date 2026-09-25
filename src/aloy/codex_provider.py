@@ -6,7 +6,16 @@ import os
 from collections.abc import AsyncIterator
 from pathlib import Path
 
-from aloy.contracts import AgentConfig, ContextOverflowError, Message, ProviderEvent
+from aloy.contracts import (
+    AgentConfig,
+    ContextOverflowError,
+    Message,
+    ProviderEvent,
+    ProviderStepResult,
+    ProviderTurn,
+    ToolCall,
+    Usage,
+)
 from aloy.storage import ConversationStore, data_root
 
 DISABLED_FEATURES = (
@@ -28,6 +37,8 @@ DISABLED_FEATURES = (
 
 class CodexProvider:
     """One provider-managed turn; no claim about hidden underlying model calls."""
+
+    uses_dynamic_tools = True
 
     def __init__(self, store: ConversationStore) -> None:
         self.store = store
@@ -94,6 +105,32 @@ class CodexProvider:
         if any(states.get(feature) != "false" for feature in DISABLED_FEATURES):
             raise RuntimeError("Codex tool restrictions did not take effect")
 
+    async def step(self, turn: ProviderTurn, *, tool_callback=None) -> ProviderStepResult:
+        self._agent_turn = turn
+        self._tool_callback = tool_callback
+        text = ""
+        usage = Usage()
+        session_id = None
+        try:
+            async for event in self.stream(
+                conversation_id=turn.conversation_id,
+                system_prompt=turn.system_prompt,
+                messages=turn.messages,
+                config=turn.config,
+            ):
+                if event.kind == "delta":
+                    text += event.text
+                    if turn.on_event:
+                        turn.on_event(event)
+                elif event.kind == "usage":
+                    usage = event.usage
+                elif event.kind == "session":
+                    session_id = event.text
+            return ProviderStepResult(text=text, usage=usage, session_id=session_id)
+        finally:
+            self._agent_turn = None
+            self._tool_callback = None
+
     async def stream(
         self,
         *,
@@ -116,6 +153,7 @@ class CodexProvider:
         )
         pending: list[dict] = []
         sequence = 0
+        agent_turn = getattr(self, "_agent_turn", None)
 
         async def send(method: str, params: dict | None = None) -> int:
             nonlocal sequence
@@ -144,7 +182,10 @@ class CodexProvider:
             await response(
                 await send(
                     "initialize",
-                    {"clientInfo": {"name": "aloy", "title": "Aloy", "version": "0.0.1"}},
+                    {
+                        "clientInfo": {"name": "aloy", "title": "Aloy", "version": "0.0.1"},
+                        "capabilities": {"experimentalApi": True},
+                    },
                 )
             )
             process.stdin.write(b'{"method":"initialized"}\n')
@@ -175,7 +216,14 @@ class CodexProvider:
             ):
                 raise RuntimeError("Codex skills were not disabled")
             session = self.store.get_session(conversation_id, f"codex:{config.model}")
-            if session and session["synced_sequence"] == len(messages) - 1:
+            can_resume = bool(session and session["synced_sequence"] == len(messages) - 1)
+            if agent_turn is not None:
+                can_resume = bool(
+                    session
+                    and agent_turn.continuation_id
+                    and session["session_id"] == agent_turn.continuation_id
+                )
+            if can_resume:
                 result = await response(
                     await send(
                         "thread/resume",
@@ -197,8 +245,23 @@ class CodexProvider:
                             "approvalPolicy": "never",
                             "sandbox": "read-only",
                             "baseInstructions": system_prompt
-                            + " Respond only with conversational text. Do not use tools.",
+                            + (
+                                " Use only the explicitly supplied Aloy tools."
+                                if agent_turn and agent_turn.tools
+                                else " Respond only with conversational text. Do not use tools."
+                            ),
                             "serviceName": "aloy",
+                            "dynamicTools": [
+                                {
+                                    "type": "function",
+                                    "name": spec.name.replace(".", "_"),
+                                    "description": spec.description,
+                                    "inputSchema": spec.input_schema,
+                                }
+                                for spec in agent_turn.tools
+                            ]
+                            if agent_turn
+                            else [],
                         },
                     )
                 )
@@ -208,16 +271,24 @@ class CodexProvider:
                     + "\nReply to the latest user message."
                 )
             thread_id = result["thread"]["id"]
+            turn_input = [{"type": "text", "text": input_text}]
+            if agent_turn:
+                turn_input.extend(
+                    {"type": "localImage", "path": asset["path"]}
+                    for asset in agent_turn.media
+                    if asset["kind"] == "image"
+                )
             await response(
                 await send(
                     "turn/start",
                     {
                         "threadId": thread_id,
-                        "input": [{"type": "text", "text": input_text}],
+                        "input": turn_input,
                         "cwd": str(self.workspace),
                         "model": config.model,
                         "approvalPolicy": "never",
                         "sandboxPolicy": {"type": "readOnly"},
+                        "outputSchema": config.output_schema,
                     },
                 )
             )
@@ -232,14 +303,44 @@ class CodexProvider:
                     packet = json.loads(line)
                 method = packet.get("method", "")
                 if "id" in packet and method:
-                    raise RuntimeError(
-                        "Codex requested a tool or approval; text-only turn rejected"
-                    )
+                    if (
+                        method == "item/tool/call"
+                        and agent_turn is not None
+                        and self._tool_callback is not None
+                    ):
+                        params = packet.get("params", {})
+                        tool_call = ToolCall(
+                            params.get("callId", ""),
+                            params.get("tool", "").replace("_", ".", 1),
+                            params.get("arguments", {}),
+                        )
+                        result = await self._tool_callback(tool_call)
+                        reply = {
+                            "id": packet["id"],
+                            "result": {
+                                "success": result.success,
+                                "contentItems": [
+                                    {
+                                        "type": "inputText",
+                                        "text": json.dumps(result.value, ensure_ascii=False),
+                                    }
+                                ],
+                            },
+                        }
+                        process.stdin.write((json.dumps(reply) + "\n").encode())
+                        await process.stdin.drain()
+                        continue
+                    raise RuntimeError("Codex requested a disabled tool or approval")
                 if method == "item/agentMessage/delta":
                     delta = packet.get("params", {}).get("delta", "")
                     if delta:
                         emitted = True
                         yield ProviderEvent("delta", delta)
+                elif method == "thread/tokenUsage/updated":
+                    usage = packet.get("params", {}).get("tokenUsage", {}).get("last", {})
+                    yield ProviderEvent(
+                        "usage", usage=Usage(usage.get("inputTokens"), usage.get("outputTokens"))
+                    )
                 elif method == "item/started":
                     item_type = packet.get("params", {}).get("item", {}).get("type")
                     if item_type == "contextCompaction":
@@ -249,6 +350,7 @@ class CodexProvider:
                         "agentMessage",
                         "reasoning",
                         "plan",
+                        "dynamicToolCall",
                     ):
                         raise RuntimeError(f"Codex attempted a non-text item: {item_type}")
                 elif method == "turn/completed":

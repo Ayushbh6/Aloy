@@ -3,7 +3,9 @@
 # ruff: noqa: E501
 
 import hashlib
+import json
 import os
+import re
 import sqlite3
 import uuid
 from contextlib import contextmanager
@@ -73,6 +75,14 @@ class ConversationStore:
             )
             # Dispatched reservations remain charged: remote billing is uncertain.
             self.db.execute("UPDATE reservations SET status='settled' WHERE status='dispatched'")
+            self.db.execute(
+                "UPDATE run_steps SET status='interrupted',ended_at=? WHERE status='running'",
+                (_now(),),
+            )
+            self.db.execute(
+                "UPDATE provider_calls SET status='interrupted',ended_at=? WHERE status='running'",
+                (_now(),),
+            )
             for asset in self.db.execute("SELECT id,path FROM audio_assets"):
                 if not Path(asset["path"]).exists():
                     self.db.execute(
@@ -82,7 +92,13 @@ class ConversationStore:
         self.drain_deletions()
         # Unreferenced audio/tmp files are retained, never silently deleted.
 
-    def reserve(self, amount: float, ceiling: float = 30.0) -> str:
+    def reserve(self, amount: float, ceiling: float = 30.0, provider: str = "unattributed") -> str:
+        provider = {
+            "gemini-quality": "gemini",
+            "gemini-live": "gemini",
+            "gemini-lite": "gemini",
+            "router-grok": "openrouter",
+        }.get(provider, provider)
         if amount < 0:
             raise ValueError("Negative reservation")
         reservation_id = str(uuid.uuid4())
@@ -92,7 +108,9 @@ class ConversationStore:
             if self.monthly_spend() + amount > ceiling:
                 raise RuntimeError("Aloy's monthly estimated spend limit has been reached")
             self.db.execute(
-                "INSERT INTO reservations VALUES(?,?,?,?)", (reservation_id, amount, "held", _now())
+                "INSERT INTO reservations(id,amount_usd,status,created_at,provider) "
+                "VALUES(?,?,?,?,?)",
+                (reservation_id, amount, "held", _now(), provider),
             )
         return reservation_id
 
@@ -162,7 +180,10 @@ class ConversationStore:
     def drain_deletions(self) -> None:
         for row in self.db.execute("SELECT path FROM pending_deletions").fetchall():
             path = Path(row[0])
-            if not path.resolve().is_relative_to((self.root / "audio").resolve()):
+            if not any(
+                path.resolve().is_relative_to((self.root / folder).resolve())
+                for folder in ("audio", "media")
+            ):
                 continue
             try:
                 path.unlink(missing_ok=True)
@@ -181,6 +202,35 @@ class ConversationStore:
             (conversation_id, title, system_prompt, now, now),
         )
         return conversation_id
+
+    def rename_conversation(self, conversation_id: str, title: str) -> dict:
+        self.conversation(conversation_id)
+        title = " ".join(title.split()).strip()
+        if not title or len(title) > 100 or any(ord(char) < 32 for char in title):
+            raise ValueError("Conversation title must be 1 to 100 characters")
+        self.db.execute(
+            "UPDATE conversations SET title=?,updated_at=? WHERE id=?",
+            (title, _now(), conversation_id),
+        )
+        return dict(self.conversation(conversation_id))
+
+    def search_conversations(self, query: str, limit: int = 50) -> list[dict]:
+        if not isinstance(query, str) or not query.strip() or len(query) > 200:
+            raise ValueError("Conversation search must be 1 to 200 characters")
+        terms = re.findall(r"\w+", query, re.UNICODE)[:12]
+        if not terms:
+            return []
+        match = " OR ".join('"' + term.replace('"', "") + '"' for term in terms)
+        rows = self.db.execute(
+            "SELECT c.id,c.title,c.updated_at,MIN(message_fts.rank) AS rank "
+            "FROM message_fts JOIN conversations c ON c.id=message_fts.conversation_id "
+            "WHERE message_fts MATCH ? GROUP BY c.id ORDER BY rank LIMIT ?",
+            (match, max(1, min(limit, 50))),
+        ).fetchall()
+        return [
+            {"id": row["id"], "title": row["title"], "updated_at": row["updated_at"]}
+            for row in rows
+        ]
 
     def conversation(self, conversation_id: str) -> sqlite3.Row:
         row = self.db.execute(
@@ -208,19 +258,39 @@ class ConversationStore:
 
     def completed_history(self, conversation_id: str) -> list[Message]:
         return [
-            Message(row["role"], row["text"])
-            for row in self.messages(conversation_id)
-            if row["status"] == "complete"
+            Message(row["role"], row["text"], origin=row.get("origin", ""))
+            for row in self.completed_messages(conversation_id)
         ]
 
-    def begin_run(self, conversation_id: str, provider: str, model: str, user_text: str) -> str:
+    def completed_messages(self, conversation_id: str) -> list[dict]:
+        return [
+            dict(row)
+            for row in self.db.execute(
+                "SELECT m.* FROM messages m JOIN runs r ON r.id=m.run_id "
+                "WHERE m.conversation_id=? AND m.status='complete' AND r.status='completed' "
+                "ORDER BY m.sequence",
+                (conversation_id,),
+            )
+        ]
+
+    def begin_run(
+        self,
+        conversation_id: str,
+        provider: str,
+        model: str,
+        user_text: str,
+        *,
+        input_origin: str = "user",
+    ) -> str:
+        if input_origin not in {"user", "canvas_interaction"}:
+            raise ValueError("Unsupported user input origin")
         run_id = str(uuid.uuid4())
         with self.transaction():
             self.db.execute(
                 "INSERT INTO runs(id,conversation_id,provider,model,status,started_at) VALUES(?,?,?,?,?,?)",
                 (run_id, conversation_id, provider, model, "running", _now()),
             )
-            self._add_message(conversation_id, run_id, "user", user_text, "complete")
+            self._add_message(conversation_id, run_id, "user", user_text, "complete", input_origin)
             self.db.execute(
                 "UPDATE conversations SET updated_at=?, title=CASE WHEN title='New conversation' "
                 "THEN ? ELSE title END WHERE id=?",
@@ -246,11 +316,19 @@ class ConversationStore:
             )
 
     def _add_message(
-        self, conversation_id: str, run_id: str, role: str, text: str, status: str
+        self,
+        conversation_id: str,
+        run_id: str,
+        role: str,
+        text: str,
+        status: str,
+        origin: str | None = None,
     ) -> str:
+        origin = origin or ("assistant" if role == "assistant" else "user")
         message_id = str(uuid.uuid4())
         self.db.execute(
-            "INSERT INTO messages VALUES(?,?,?,?,?,?,?,?)",
+            "INSERT INTO messages(id,conversation_id,run_id,sequence,role,text,status,created_at,origin) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
             (
                 message_id,
                 conversation_id,
@@ -263,6 +341,7 @@ class ConversationStore:
                 text,
                 status,
                 _now(),
+                origin,
             ),
         )
         return message_id
@@ -297,9 +376,10 @@ class ConversationStore:
             )
             if not accounted and usage.estimated_usd is not None and usage.estimated_usd > 0:
                 self.db.execute(
-                    "INSERT INTO spend_events VALUES('run',?,?,?) "
+                    "INSERT INTO spend_events(source_type,source_id,amount_usd,created_at,provider) "
+                    "VALUES('run',?,?,?,?) "
                     "ON CONFLICT(source_type,source_id) DO UPDATE SET amount_usd=excluded.amount_usd",
-                    (run_id, usage.estimated_usd, _now()),
+                    (run_id, usage.estimated_usd, _now(), self.run(run_id)["provider"]),
                 )
             if text:
                 self._add_message(
@@ -323,15 +403,19 @@ class ConversationStore:
             raise KeyError(run_id)
         return dict(row)
 
-    def monthly_spend(self) -> float:
+    def monthly_spend(self, provider: str | None = None) -> float:
         month = datetime.now(UTC).strftime("%Y-%m")
+        provider_clause = " AND provider=?" if provider else ""
+        args = (month + "%", provider) if provider else (month + "%",)
         amount = self.db.execute(
-            "SELECT COALESCE(SUM(amount_usd),0) FROM spend_events WHERE created_at LIKE ?",
-            (month + "%",),
+            "SELECT COALESCE(SUM(amount_usd),0) FROM spend_events WHERE created_at LIKE ?"
+            + provider_clause,
+            args,
         ).fetchone()[0]
         reserved = self.db.execute(
-            "SELECT COALESCE(SUM(amount_usd),0) FROM reservations WHERE status!='settled' OR created_at LIKE ?",
-            (month + "%",),
+            "SELECT COALESCE(SUM(amount_usd),0) FROM reservations WHERE "
+            "(status!='settled' OR created_at LIKE ?)" + provider_clause,
+            args,
         ).fetchone()[0]
         return float(amount + reserved)
 
@@ -388,8 +472,9 @@ class ConversationStore:
                 )
                 if not accounted and estimated_usd is not None and estimated_usd > 0:
                     self.db.execute(
-                        "INSERT INTO spend_events VALUES('audio',?,?,?)",
-                        (asset_id, estimated_usd, _now()),
+                        "INSERT INTO spend_events(source_type,source_id,amount_usd,created_at,provider) "
+                        "VALUES('audio',?,?,?,?)",
+                        (asset_id, estimated_usd, _now(), provider or "unattributed"),
                     )
         except BaseException:
             temporary.unlink(missing_ok=True)
@@ -426,9 +511,11 @@ class ConversationStore:
     def delete_conversation(self, conversation_id: str) -> None:
         self.conversation(conversation_id)
         paths = [Path(row["path"]) for row in self.audio_assets(conversation_id)]
-        folder = self.root / "audio" / conversation_id
-        if folder.exists():
-            paths.extend(path for path in folder.iterdir() if path.is_file())
+        paths.extend(Path(row["path"]) for row in self.media_assets(conversation_id))
+        for category in ("audio", "media"):
+            folder = self.root / category / conversation_id
+            if folder.exists():
+                paths.extend(path for path in folder.iterdir() if path.is_file())
         with self.transaction():
             self.db.executemany(
                 "INSERT OR IGNORE INTO pending_deletions VALUES(?)",
@@ -436,9 +523,10 @@ class ConversationStore:
             )
             self.db.execute("DELETE FROM conversations WHERE id=?", (conversation_id,))
         self.drain_deletions()
-        folder = self.root / "audio" / conversation_id
-        if folder.exists() and not any(folder.iterdir()):
-            folder.rmdir()
+        for category in ("audio", "media"):
+            folder = self.root / category / conversation_id
+            if folder.exists() and not any(folder.iterdir()):
+                folder.rmdir()
 
     def get_session(self, conversation_id: str, provider: str) -> dict | None:
         row = self.db.execute(
@@ -457,11 +545,567 @@ class ConversationStore:
         )
 
     def set_session(
-        self, conversation_id: str, provider: str, session_id: str, synced_sequence: int
+        self,
+        conversation_id: str,
+        provider: str,
+        session_id: str,
+        synced_sequence: int,
+        context_revision: int = 0,
+        tool_hash: str = "",
     ) -> None:
         self.db.execute(
-            "INSERT INTO provider_sessions VALUES(?,?,?,?,?) ON CONFLICT(conversation_id,provider) "
+            "INSERT INTO provider_sessions(conversation_id,provider,session_id,synced_sequence,"
+            "updated_at,context_revision,tool_hash) VALUES(?,?,?,?,?,?,?) "
+            "ON CONFLICT(conversation_id,provider) "
             "DO UPDATE SET session_id=excluded.session_id,synced_sequence=excluded.synced_sequence,"
-            "updated_at=excluded.updated_at",
-            (conversation_id, provider, session_id, synced_sequence, _now()),
+            "updated_at=excluded.updated_at,context_revision=excluded.context_revision,"
+            "tool_hash=excluded.tool_hash",
+            (
+                conversation_id,
+                provider,
+                session_id,
+                synced_sequence,
+                _now(),
+                context_revision,
+                tool_hash,
+            ),
         )
+
+    def begin_step(
+        self, run_id: str, kind: str, name: str = "", arguments: dict | None = None
+    ) -> str:
+        step_id = str(uuid.uuid4())
+        with self.transaction():
+            sequence = self.db.execute(
+                "SELECT COALESCE(MAX(sequence),0)+1 FROM run_steps WHERE run_id=?", (run_id,)
+            ).fetchone()[0]
+            self.db.execute(
+                "INSERT INTO run_steps(id,run_id,sequence,kind,status,name,arguments_json,started_at) "
+                "VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    step_id,
+                    run_id,
+                    sequence,
+                    kind,
+                    "running",
+                    name,
+                    json.dumps(arguments or {}, ensure_ascii=False),
+                    _now(),
+                ),
+            )
+        return step_id
+
+    def finish_step(
+        self, step_id: str, status: str, result: dict | None = None, error: str = ""
+    ) -> None:
+        if status not in {"completed", "failed", "cancelled", "interrupted"}:
+            raise ValueError("Invalid step outcome")
+        with self.transaction():
+            self.db.execute(
+                "UPDATE run_steps SET status=?,result_json=?,error=?,ended_at=? WHERE id=?",
+                (
+                    status,
+                    json.dumps(result, ensure_ascii=False) if result is not None else None,
+                    error[:500] if error else None,
+                    _now(),
+                    step_id,
+                ),
+            )
+
+    def steps(self, run_id: str) -> list[dict]:
+        return [
+            dict(row)
+            for row in self.db.execute(
+                "SELECT * FROM run_steps WHERE run_id=? ORDER BY sequence", (run_id,)
+            )
+        ]
+
+    def begin_provider_call(
+        self,
+        run_id: str | None,
+        purpose: str,
+        provider: str,
+        model: str,
+        reservation_id: str | None = None,
+    ) -> str:
+        call_id = str(uuid.uuid4())
+        with self.transaction():
+            self.db.execute(
+                "INSERT INTO provider_calls(id,run_id,purpose,provider,model,status,"
+                "reservation_id,started_at) VALUES(?,?,?,?,?,?,?,?)",
+                (call_id, run_id, purpose, provider, model, "running", reservation_id, _now()),
+            )
+        return call_id
+
+    def finish_provider_call(self, call_id: str, status: str, usage: Usage | None = None) -> None:
+        usage = usage or Usage()
+        with self.transaction():
+            self.db.execute(
+                "UPDATE provider_calls SET status=?,input_tokens=?,output_tokens=?,"
+                "estimated_usd=?,ended_at=? WHERE id=?",
+                (
+                    status,
+                    usage.input_tokens,
+                    usage.output_tokens,
+                    usage.estimated_usd,
+                    _now(),
+                    call_id,
+                ),
+            )
+
+    def save_source(self, run_id: str, title: str, url: str, snippet: str) -> dict:
+        source_id = str(uuid.uuid4())
+        with self.transaction():
+            self.db.execute(
+                "INSERT INTO web_sources VALUES(?,?,?,?,?,?)",
+                (source_id, run_id, title[:300], url[:2048], snippet[:2000], _now()),
+            )
+        return {"id": source_id, "title": title, "url": url, "snippet": snippet}
+
+    def sources(self, run_id: str) -> list[dict]:
+        return [
+            dict(row)
+            for row in self.db.execute(
+                "SELECT * FROM web_sources WHERE run_id=? ORDER BY created_at", (run_id,)
+            )
+        ]
+
+    def save_artifact(self, run_id: str, kind: str, payload: dict, version: int = 1) -> dict:
+        run = self.run(run_id)
+        artifact_id = str(uuid.uuid4())
+        created_at = _now()
+        with self.transaction():
+            sequence = self.db.execute(
+                "SELECT COALESCE(MAX(sequence),0)+1 FROM artifacts WHERE run_id=?", (run_id,)
+            ).fetchone()[0]
+            self.db.execute(
+                "INSERT INTO artifacts(id,run_id,version,kind,payload_json,created_at,"
+                "conversation_id,sequence,operation_id) VALUES(?,?,?,?,?,?,?,?,?)",
+                (
+                    artifact_id,
+                    run_id,
+                    version,
+                    kind,
+                    json.dumps(payload, ensure_ascii=False),
+                    created_at,
+                    run["conversation_id"],
+                    sequence,
+                    "",
+                ),
+            )
+        return {
+            "id": artifact_id,
+            "run_id": run_id,
+            "version": version,
+            "kind": kind,
+            "payload": payload,
+        }
+
+    def save_canvas_artifact(self, run_id: str, payload: dict, *, operation_id: str = "") -> dict:
+        run = self.run(run_id)
+        artifact_id = str(uuid.uuid4())
+        created_at = _now()
+        with self.transaction():
+            sequence = self.db.execute(
+                "SELECT COALESCE(MAX(sequence),0)+1 FROM artifacts WHERE run_id=?", (run_id,)
+            ).fetchone()[0]
+            envelope = {
+                "schema_version": 1,
+                "artifact_id": artifact_id,
+                "conversation_id": run["conversation_id"],
+                "run_id": run_id,
+                "sequence": sequence,
+                "created_at": created_at,
+                "title": payload["title"],
+                "blocks": payload["blocks"],
+            }
+            if len(json.dumps(envelope, ensure_ascii=False).encode()) > 24_000:
+                raise ValueError("Canvas artifact exceeds the persisted size limit")
+            self.db.execute(
+                "INSERT INTO artifacts(id,run_id,version,kind,payload_json,created_at,"
+                "conversation_id,sequence,operation_id) VALUES(?,?,?,?,?,?,?,?,?)",
+                (
+                    artifact_id,
+                    run_id,
+                    1,
+                    "canvas",
+                    json.dumps(envelope, ensure_ascii=False),
+                    created_at,
+                    run["conversation_id"],
+                    sequence,
+                    operation_id,
+                ),
+            )
+        return envelope
+
+    def canvas_artifacts(self, conversation_id: str) -> list[dict]:
+        self.conversation(conversation_id)
+        rows = self.db.execute(
+            "SELECT a.payload_json FROM artifacts a JOIN runs r ON r.id=a.run_id "
+            "WHERE a.conversation_id=? AND a.kind='canvas' AND r.status='completed' "
+            "ORDER BY a.created_at,a.sequence,a.id",
+            (conversation_id,),
+        ).fetchall()
+        return [json.loads(row["payload_json"]) for row in rows]
+
+    def resolve_canvas_interaction(
+        self,
+        conversation_id: str,
+        artifact_id: str,
+        run_id: str,
+        block_id: str,
+        interaction: str,
+        value: str,
+    ) -> dict:
+        row = self.db.execute(
+            "SELECT a.payload_json,r.status FROM artifacts a JOIN runs r ON r.id=a.run_id "
+            "WHERE a.id=? AND a.run_id=? AND a.conversation_id=? AND a.kind='canvas'",
+            (artifact_id, run_id, conversation_id),
+        ).fetchone()
+        if row is None or row["status"] != "completed":
+            raise ValueError("Canvas artifact is not available for interaction")
+        artifact = json.loads(row["payload_json"])
+        if artifact.get("artifact_id") != artifact_id or artifact.get("run_id") != run_id:
+            raise ValueError("Canvas artifact metadata does not match its record")
+        block = next((item for item in artifact["blocks"] if item["id"] == block_id), None)
+        if block is None or not isinstance(value, str) or len(value) > 1_200:
+            raise ValueError("Canvas interaction does not match a block")
+        if interaction == "choose" and block["kind"] == "choice":
+            selected = next((item for item in block["options"] if item["id"] == value), None)
+            if selected is None:
+                raise ValueError("Selected option is not part of this choice")
+            label = selected["label"]
+        elif (
+            interaction == "transform" and block["kind"] == "sentence" and value == block["target"]
+        ):
+            label = value
+        else:
+            raise ValueError("Canvas interaction type or value is invalid")
+        return {
+            "artifact_id": artifact_id,
+            "conversation_id": conversation_id,
+            "run_id": run_id,
+            "block_id": block_id,
+            "interaction": interaction,
+            "value": value,
+            "label": label,
+            "artifact_title": artifact["title"],
+            "block_kind": block["kind"],
+            "block": block,
+        }
+
+    def save_media(
+        self,
+        conversation_id: str,
+        data: bytes,
+        *,
+        kind: str,
+        mime_type: str,
+        run_id: str | None = None,
+        duration_seconds: float | None = None,
+    ) -> dict:
+        self.conversation(conversation_id)
+        formats = {
+            ("image", "image/png"): "png",
+            ("image", "image/jpeg"): "jpg",
+            ("video", "video/mp4"): "mp4",
+            ("video", "video/quicktime"): "mov",
+            ("audio", "audio/wav"): "wav",
+            ("audio", "audio/mpeg"): "mp3",
+            ("audio", "audio/mp4"): "m4a",
+        }
+        extension = formats.get((kind, mime_type))
+        if extension is None or not data or len(data) > 120_000_000:
+            raise ValueError("Unsupported or oversized media")
+        asset_id = str(uuid.uuid4())
+        folder = self.root / "media" / conversation_id
+        folder.mkdir(parents=True, exist_ok=True)
+        folder.chmod(0o700)
+        path = folder / f"{asset_id}.{extension}"
+        temporary = folder / f".{asset_id}.tmp"
+        try:
+            descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(descriptor, "wb") as file:
+                file.write(data)
+                file.flush()
+                os.fsync(file.fileno())
+            temporary.replace(path)
+            with self.transaction():
+                self.db.execute(
+                    "INSERT INTO media_assets VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        asset_id,
+                        conversation_id,
+                        run_id,
+                        kind,
+                        str(path),
+                        mime_type,
+                        len(data),
+                        hashlib.sha256(data).hexdigest(),
+                        duration_seconds,
+                        _now(),
+                    ),
+                )
+        except BaseException:
+            temporary.unlink(missing_ok=True)
+            path.unlink(missing_ok=True)
+            raise
+        return {"id": asset_id, "path": str(path), "kind": kind, "mime_type": mime_type}
+
+    def media_asset(self, asset_id: str) -> dict:
+        row = self.db.execute("SELECT * FROM media_assets WHERE id=?", (asset_id,)).fetchone()
+        if row is None:
+            raise KeyError(asset_id)
+        return dict(row)
+
+    def media_assets(self, conversation_id: str) -> list[dict]:
+        return [
+            dict(row)
+            for row in self.db.execute(
+                "SELECT * FROM media_assets WHERE conversation_id=? ORDER BY created_at",
+                (conversation_id,),
+            )
+        ]
+
+    def remember(
+        self,
+        text: str,
+        category: str,
+        *,
+        scope: str = "global",
+        conversation_id: str | None = None,
+        source_message_id: str | None = None,
+        evidence_type: str = "user_statement",
+        confidence: float = 1.0,
+    ) -> dict:
+        normalized = " ".join(text.split()).strip()
+        if not normalized or len(normalized) > 1500 or scope not in {"global", "conversation"}:
+            raise ValueError("Invalid memory")
+        from aloy.privacy import PRIVATE_PATTERN
+
+        if scope == "conversation" and not conversation_id:
+            raise ValueError("Conversation-scoped memory requires a conversation")
+        if PRIVATE_PATTERN.search(normalized):
+            raise ValueError("Sensitive content cannot be saved as memory")
+        existing = self.db.execute(
+            "SELECT id FROM memories WHERE lower(text)=lower(?) AND scope=? AND "
+            "COALESCE(conversation_id,'')=COALESCE(?,'') AND status='active' LIMIT 1",
+            (normalized, scope, conversation_id),
+        ).fetchone()
+        if existing:
+            return self.memory(existing[0])
+
+        def words(value: str) -> set[str]:
+            return set(re.findall(r"\w+", value.casefold())) - {
+                "i",
+                "my",
+                "a",
+                "the",
+                "that",
+                "to",
+                "and",
+                "am",
+                "is",
+                "want",
+            }
+
+        candidate = words(normalized)
+        superseded = []
+        for row in self.memories(200):
+            if row["scope"] != scope or row["conversation_id"] != conversation_id:
+                continue
+            other = words(row["text"])
+            if candidate and other and len(candidate & other) / len(candidate | other) >= 0.78:
+                if row["text"].casefold() == normalized.casefold():
+                    return row
+                # Keep the prior claim as a tombstone, with its original source intact.
+                superseded.append(row["id"])
+        memory_id = str(uuid.uuid4())
+        with self.transaction():
+            for old_id in superseded:
+                self.forget(old_id)
+            self.db.execute(
+                "INSERT INTO memories VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    memory_id,
+                    normalized,
+                    category[:50],
+                    scope,
+                    conversation_id,
+                    source_message_id,
+                    evidence_type,
+                    confidence,
+                    "active",
+                    _now(),
+                    _now(),
+                ),
+            )
+        return self.memory(memory_id)
+
+    def memory(self, memory_id: str) -> dict:
+        row = self.db.execute("SELECT * FROM memories WHERE id=?", (memory_id,)).fetchone()
+        if row is None:
+            raise KeyError(memory_id)
+        return dict(row)
+
+    def memories(self, limit: int = 100) -> list[dict]:
+        return [
+            dict(row)
+            for row in self.db.execute(
+                "SELECT * FROM memories WHERE status='active' ORDER BY updated_at DESC LIMIT ?",
+                (max(1, min(limit, 500)),),
+            )
+        ]
+
+    def forget(self, memory_id: str) -> None:
+        with self.transaction():
+            changed = self.db.execute(
+                "UPDATE memories SET status='forgotten',updated_at=? WHERE id=?",
+                (_now(), memory_id),
+            ).rowcount
+            if changed == 0:
+                raise KeyError(memory_id)
+
+    def save_summary(self, conversation_id: str, through_sequence: int, text: str) -> dict:
+        with self.transaction():
+            revision = self.db.execute(
+                "SELECT COALESCE(MAX(revision),0)+1 FROM conversation_summaries WHERE conversation_id=?",
+                (conversation_id,),
+            ).fetchone()[0]
+            summary_id = str(uuid.uuid4())
+            self.db.execute(
+                "INSERT INTO conversation_summaries VALUES(?,?,?,?,?,?)",
+                (summary_id, conversation_id, revision, through_sequence, text, _now()),
+            )
+        return self.summary(conversation_id)
+
+    def summary(self, conversation_id: str) -> dict | None:
+        row = self.db.execute(
+            "SELECT * FROM conversation_summaries WHERE conversation_id=? "
+            "ORDER BY revision DESC LIMIT 1",
+            (conversation_id,),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def search_text(self, query: str, *, mode: str = "fts", limit: int = 8) -> list[dict]:
+        limit = max(1, min(limit, 50))
+        if mode == "fts":
+            # Quote the user's words so FTS syntax cannot change query meaning.
+            terms = re.findall(r"\w+", query, re.UNICODE)[:12]
+            if not terms:
+                return []
+            match = " OR ".join('"' + term.replace('"', "") + '"' for term in terms)
+            rows = self.db.execute(
+                "SELECT message_id AS id,'message' AS kind,text FROM message_fts "
+                "WHERE message_fts MATCH ? ORDER BY rank LIMIT ?",
+                (match, limit),
+            ).fetchall()
+            rows += self.db.execute(
+                "SELECT memory_id AS id,'memory' AS kind,text FROM memory_fts "
+                "WHERE memory_fts MATCH ? ORDER BY rank LIMIT ?",
+                (match, limit),
+            ).fetchall()
+            rows += self.db.execute(
+                "SELECT summary_id AS id,'summary' AS kind,text FROM summary_fts "
+                "WHERE summary_fts MATCH ? ORDER BY rank LIMIT ?",
+                (match, limit),
+            ).fetchall()
+        elif mode in {"exact", "substring"}:
+            rows = self.db.execute(
+                "SELECT id,'message' AS kind,text FROM messages WHERE status='complete' AND "
+                "instr(lower(text),lower(?))>0 ORDER BY created_at DESC LIMIT ?",
+                (query, limit),
+            ).fetchall()
+            rows += self.db.execute(
+                "SELECT id,'memory' AS kind,text FROM memories WHERE status='active' AND "
+                "instr(lower(text),lower(?))>0 ORDER BY updated_at DESC LIMIT ?",
+                (query, limit),
+            ).fetchall()
+            rows += self.db.execute(
+                "SELECT id,'summary' AS kind,text FROM conversation_summaries "
+                "WHERE instr(lower(text),lower(?))>0 ORDER BY created_at DESC LIMIT ?",
+                (query, limit),
+            ).fetchall()
+            if mode == "exact":
+                rows = [row for row in rows if row["text"].casefold() == query.casefold()]
+        elif mode == "regex":
+            if len(query) > 200:
+                raise ValueError("Regex is too long")
+            import regex
+
+            pattern = regex.compile(query, regex.IGNORECASE)
+            candidates = self.db.execute(
+                "SELECT id,'message' AS kind,text FROM messages WHERE status='complete' "
+                "ORDER BY created_at DESC LIMIT 2000"
+            ).fetchall()
+            candidates += self.db.execute(
+                "SELECT id,'memory' AS kind,text FROM memories WHERE status='active' "
+                "ORDER BY updated_at DESC LIMIT 500"
+            ).fetchall()
+            candidates += self.db.execute(
+                "SELECT id,'summary' AS kind,text FROM conversation_summaries "
+                "ORDER BY created_at DESC LIMIT 500"
+            ).fetchall()
+            rows = []
+            import time
+
+            deadline = time.monotonic() + 0.15
+            for row in candidates:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise ValueError("Regex search exceeded its time limit")
+                try:
+                    if pattern.search(row["text"], timeout=remaining):
+                        rows.append(row)
+                except TimeoutError as exc:
+                    raise ValueError("Regex search exceeded its time limit") from exc
+                if len(rows) >= limit:
+                    break
+        else:
+            raise ValueError("Unknown search mode")
+        results = []
+        for row in rows:
+            entity = self.index_entity(row["kind"], row["id"])
+            if entity is not None:
+                results.append(
+                    {
+                        **dict(row),
+                        "conversation_id": entity.get("conversation_id"),
+                        "scope": entity.get("scope"),
+                    }
+                )
+        from itertools import zip_longest
+
+        groups = [
+            [row for row in results if row["kind"] == kind]
+            for kind in ("memory", "message", "summary")
+        ]
+        return [row for group in zip_longest(*groups) for row in group if row][:limit]
+
+    def pending_index(self, limit: int = 100) -> list[dict]:
+        return [
+            dict(row)
+            for row in self.db.execute(
+                "SELECT * FROM index_outbox WHERE indexed_at IS NULL ORDER BY id LIMIT ?",
+                (limit,),
+            )
+        ]
+
+    def indexed(self, outbox_id: int) -> None:
+        with self.transaction():
+            self.db.execute("UPDATE index_outbox SET indexed_at=? WHERE id=?", (_now(), outbox_id))
+
+    def index_entity(self, entity_type: str, entity_id: str) -> dict | None:
+        tables = {"message": "messages", "memory": "memories", "summary": "conversation_summaries"}
+        if entity_type not in tables:
+            raise ValueError("Unknown index entity")
+        row = self.db.execute(
+            f"SELECT * FROM {tables[entity_type]} WHERE id=?", (entity_id,)
+        ).fetchone()
+        if row is None or (entity_type == "memory" and row["status"] != "active"):
+            return None
+        if entity_type == "message" and row["status"] != "complete":
+            return None
+        if entity_type == "message" and self.run(row["run_id"])["status"] != "completed":
+            return None
+        return dict(row)
