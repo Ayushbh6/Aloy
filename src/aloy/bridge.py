@@ -412,7 +412,7 @@ class Bridge:
                 key, value = request["key"], request["value"]
                 allowed = {
                     "provider": set(MODEL_PRESETS),
-                    "speech": {"qwen", "qwen-aiden", "pocket", "gemini", "none"},
+                    "speech": {"qwen", "qwen-aiden", "chatterbox", "pocket", "gemini", "none"},
                     "mode": {"standard", "live"},
                 }
                 if key not in allowed or value not in allowed[key]:
@@ -432,8 +432,15 @@ class Bridge:
                 provider_name = request.get("provider", "gemini")
                 if provider_name not in MODEL_PRESETS:
                     raise ValueError("Unknown provider")
-                speech_engine = request.get("speech", "qwen")
-                if speech_engine not in (None, "gemini", "pocket", "qwen", "qwen-aiden"):
+                speech_engine = request.get("speech", "chatterbox")
+                if speech_engine not in (
+                    None,
+                    "gemini",
+                    "pocket",
+                    "qwen",
+                    "qwen-aiden",
+                    "chatterbox",
+                ):
                     raise ValueError("Unknown speech engine")
                 conversation_id = request["conversation_id"]
                 if action == "send":

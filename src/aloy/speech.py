@@ -4,6 +4,7 @@ import asyncio
 import base64
 import io
 import os
+import re
 import subprocess
 import threading
 import wave
@@ -11,8 +12,9 @@ from pathlib import Path
 from typing import Protocol
 
 from aloy.dispatch import DispatchBudget, gemini_client
-from aloy.models import cache_dir, model_path
+from aloy.models import MODELS, cache_dir, model_path
 from aloy.speech_worker import SpeechWorker
+from aloy.storage import data_root
 
 os.environ.setdefault("HF_HOME", str(cache_dir().parent))
 
@@ -182,6 +184,105 @@ class QwenSynthesizer:
         self._model = None
 
 
+class ChatterboxSynthesizer:
+    """One fixed local voice, conditioned once per worker lifetime."""
+
+    def __init__(self, reference_path: Path | None = None) -> None:
+        self.reference_path = reference_path or data_root() / "models" / "chatterbox-reference.wav"
+        self._model = None
+        self._conditionals = None
+        self.worker = SpeechWorker("chatterbox-tts")
+
+    @staticmethod
+    def language_code(text: str) -> str:
+        """Pick between the two conversation languages for this sentence."""
+        words = set(re.findall(r"[\wäöüß]+", text.casefold()))
+        german = words & {
+            "aber",
+            "bitte",
+            "das",
+            "dem",
+            "den",
+            "der",
+            "die",
+            "du",
+            "ein",
+            "eine",
+            "guten",
+            "hallo",
+            "heute",
+            "ich",
+            "ist",
+            "ja",
+            "jetzt",
+            "nicht",
+            "sehr",
+            "und",
+            "was",
+            "wie",
+            "wir",
+        }
+        english = words & {
+            "and",
+            "are",
+            "from",
+            "good",
+            "hello",
+            "how",
+            "is",
+            "please",
+            "the",
+            "today",
+            "what",
+            "you",
+            "your",
+        }
+        if german or english:
+            return "de" if len(german) > len(english) else "en"
+        return "de" if words & {"für", "schön", "über", "üben"} else "en"
+
+    def _synthesize(self, text: str) -> bytes:
+        from mlx_audio.tts.models.chatterbox.chatterbox import Model
+
+        if self._model is None:
+            if not self.reference_path.is_file():
+                raise RuntimeError("Chatterbox reference voice is missing")
+            checkpoint = model_path("chatterbox")
+            tokenizer = model_path("chatterbox-tokenizer")
+            # MLX Audio requests S3TokenizerV2 at its default revision. In Aloy's
+            # offline worker, point that cache alias at our verified pinned snapshot.
+            alias = tokenizer.parent.parent / "refs" / "main"
+            alias.parent.mkdir(parents=True, exist_ok=True)
+            alias.write_text(MODELS["chatterbox-tokenizer"][1])
+            model = Model.from_pretrained(checkpoint)
+            conditionals = model.prepare_conditionals(
+                str(self.reference_path), 24000, exaggeration=0.5
+            )
+            self._model, self._conditionals = model, conditionals
+        chunks = list(
+            self._model.generate(
+                text=text,
+                conds=self._conditionals,
+                lang_code=self.language_code(text),
+                exaggeration=0.5,
+                cfg_weight=0.3,
+                max_new_tokens=1200,
+                verbose=False,
+            )
+        )
+        if not chunks:
+            raise RuntimeError("Chatterbox returned no audio")
+        return pcm_to_wav(chunks[0].audio, chunks[0].sample_rate)
+
+    async def synthesize(self, text: str) -> bytes:
+        return base64.b64decode(await self.worker.request(text))
+
+    async def close(self) -> None:
+        await self.worker.close()
+        self._model = None
+        self._conditionals = None
+
+
 class GeminiSynthesizer:
     def __init__(self, api_key: str | None = None, voice: str = "Achird") -> None:
 
@@ -237,6 +338,8 @@ def make_synthesizer(name: str) -> Synthesizer:
         return QwenSynthesizer("Aiden" if name == "qwen-aiden" else "Ryan")
     if name == "gemini":
         return GeminiSynthesizer()
+    if name == "chatterbox":
+        return ChatterboxSynthesizer()
     if name == "pocket":
         return PocketSynthesizer()
     raise ValueError(f"Unknown TTS engine: {name}")

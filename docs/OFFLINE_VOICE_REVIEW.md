@@ -84,9 +84,16 @@ conditioned on one existing synthetic male voice sample. Its model and required
 S3TokenizerV2 occupy about 3.2 GB together. A 3.48-second warm sample took 3.52
 seconds to synthesize; the first generation took 5.24 seconds after a 2.09-second
 model load. Qwen ASR recovered the intended words from the sample. That checks basic
-intelligibility, not naturalness or suitability for long German lessons. Because it
-ran only about as fast as its audio and carried a 3.2 GB footprint, the temporary
-comparison weights were removed. The short private audition remains available.
+intelligibility, not naturalness or suitability for long German lessons. The owner
+liked this short sample, so the pinned model and S3TokenizerV2 were restored for
+longer trials through Aloy's speech adapter. Two German lesson snippets generated
+7.00 and 7.44 seconds of audio in 13.21 and 10.49 seconds, respectively, on this
+Mac. Qwen ASR recovered both scripts without word edits. The fake-provider-to-
+Chatterbox path also saved an output asset in an isolated conversation. Chatterbox
+does not stream audio in the current MLX implementation, so the first audible
+sound waits for the whole sentence. Chatterbox is now the selected local voice
+for the 120-hour monthly planning case. Its latency remains a limitation for
+natural back-and-forth; owner feedback on longer auditions may change the choice.
 
 The existing Gemini Interactions TTS adapter generated two comparable 10-second
 samples using `gemini-3.8-flash-lite-tts`. Full synthesis took 7.18 and 7.97 seconds.
@@ -102,23 +109,36 @@ costs $0.54 per hour of generated speech, plus a small text-input charge. The ou
 rate doubles in January 2027. OpenRouter lists the same Gemini output rate. A two-hour
 daily speaking workload therefore costs about $32.40 for 30 days at the current rate,
 before text-model usage. Aloy's existing $30 monthly cap must remain enforced; the
-paid voice cannot cover that workload continuously under the cap. Neither an idle orb
-nor local STT adds TTS charges. [Gemini pricing](https://ai.google.dev/gemini-api/docs/pricing),
+paid voice cannot cover that workload continuously under the cap. At the safer
+planning case of 120 hours of generated speech per month, output alone would cost
+about $64.80 through December 2026 and $129.60 from January 2027. Neither an idle
+orb nor local STT adds TTS charges. [Gemini pricing](https://ai.google.dev/gemini-api/docs/pricing),
 [Gemini streaming TTS](https://ai.google.dev/gemini-api/docs/speech-generation),
 [OpenRouter listing](https://openrouter.ai/google/gemini-3.8-flash-lite-tts/).
+
+For 120 monthly hours of generated speech, local Chatterbox has no speech API
+charge. At an illustrative 600–750 spoken characters per minute, ElevenLabs
+Conversational v3 or Flash/Turbo at $0.05 per 1,000 characters would cost about
+$216–270 for speech alone. OpenRouter's Gemini route lists the same $6 per million
+audio-output-token rate as Google's standard route, so switching the endpoint
+does not lower that price. Its Grok Voice TTS listing is $15 per million
+characters, or roughly $65–81 at the same speaking density; German voice quality
+has not been auditioned here. [ElevenLabs API pricing](https://elevenlabs.io/pricing/api),
+[OpenRouter Grok pricing](https://openrouter.ai/x-ai/grok-voice-tts-1.0).
 
 The native orb now keeps one green speaking appearance across gaps between audio
 chunks, turns red only for recording and stays blue while awaiting the first audio.
 Option + Z and Option + X remain the same one-hand shortcuts. Native state tests,
-38 offline Python checks and lint pass. The rebuilt app and Python backend launched.
+41 offline Python checks and lint pass. The rebuilt app and Python backend launched.
 
 ## Storage and reproducibility
 
-Selected models occupy about 5.2 GiB; the native bundle is about 372 KiB. Old 0.6B ASR,
-Pocket and Parakeet comparison weights, incomplete downloads and temporary downloader
-scripts were removed. User recordings remain intact. Small private evidence and voice
-auditions are ignored by Git.
+Selected ASR, VAD, Chatterbox and tokenizer files occupy about 5.3 GiB. Qwen TTS,
+old 0.6B ASR, Pocket and Parakeet comparison weights, incomplete downloads and
+temporary downloader scripts were removed. User recordings remain intact. Small
+private evidence and voice auditions are ignored by Git.
 
 The comparison harness uses production adapters: scripts/check_local_speech.py.
 Inputs and output evidence belong outside Git. Model registry entries allow explicit
-future comparisons, but default downloads/pruning retain only the selected three.
+future comparisons, but default downloads/pruning retain only the selected four
+model components (one TTS voice, its tokenizer, ASR and VAD).

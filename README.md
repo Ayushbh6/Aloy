@@ -13,12 +13,12 @@ python3.13 -m venv "$runtime/venv"
 ln -s "$runtime/venv" .venv
 .venv/bin/python -m pip install -r requirements-dev.txt
 .venv/bin/python -m pip install -e '.[speech]'
-.venv/bin/python -m aloy.models vad qwen-asr qwen-tts
+.venv/bin/python -m aloy.models vad qwen-asr chatterbox chatterbox-tokenizer
 zsh mac/build.sh
 open mac/build/Aloy.app
 ```
 
-Create `~/Library/Application Support/Aloy/credentials.env` with `GEMINI_API_KEY` and/or `OPENROUTER_API_KEY`, and restrict it with `chmod 600`. An ignored project `.env` remains a fallback for terminal development. The Mac app uses the one runtime under Application Support, where it installs a small wheel of the current source during `mac/build.sh`. The project `.venv` is only a link, so this does not duplicate the speech dependencies. The default is Gemini 3.5 Flash-Lite text, local Silero speech detection, Qwen3 ASR 1.7B, and Qwen3 TTS 1.7B (Ryan or Aiden). OpenRouter DeepSeek V4.1 Flash, Gemini 3.8 Flash, Gemini Flash-Lite TTS, and text-only playback are selectable. If a selected provider is unavailable, Aloy reports the error rather than silently changing models.
+Create `~/Library/Application Support/Aloy/credentials.env` with `GEMINI_API_KEY` and/or `OPENROUTER_API_KEY`, and restrict it with `chmod 600`. An ignored project `.env` remains a fallback for terminal development. The Mac app uses the one runtime under Application Support, where it installs a small wheel of the current source during `mac/build.sh`. The project `.venv` is only a link, so this does not duplicate the speech dependencies. The default is Gemini 3.5 Flash-Lite text, local Silero speech detection, Qwen3 ASR 1.7B, and Chatterbox Multilingual V3 speech. Chatterbox needs one private 24 kHz mono WAV voice reference at `~/Library/Application Support/Aloy/models/chatterbox-reference.wav`; keep that file local and use a voice you have permission to use. OpenRouter DeepSeek V4.1 Flash, Gemini 3.8 Flash, Gemini Flash-Lite TTS (Achird), and text-only playback are selectable. If a selected provider is unavailable, Aloy reports the error rather than silently changing models.
 
 The first Record click asks macOS for microphone access. Aloy shows Recording only after capture starts. Use **Finish & Send** to transcribe/send, or **Cancel recording** to keep the recording locally without sending it. Right-click Replay to hear the last input recording; a normal click replays the last reply. Development rebuilds may prompt for microphone permission again.
 

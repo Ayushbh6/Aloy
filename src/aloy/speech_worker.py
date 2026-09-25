@@ -8,6 +8,8 @@ import os
 import sys
 from pathlib import Path
 
+from aloy.models import cache_dir
+
 
 class SpeechWorker:
     def __init__(self, engine: str):
@@ -39,7 +41,12 @@ class SpeechWorker:
                             stdout=asyncio.subprocess.PIPE,
                             stderr=asyncio.subprocess.DEVNULL,
                             limit=30_000_000,
-                            env={**os.environ, "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1"},
+                            env={
+                                **os.environ,
+                                "HF_HUB_CACHE": str(cache_dir()),
+                                "HF_HUB_OFFLINE": "1",
+                                "TRANSFORMERS_OFFLINE": "1",
+                            },
                         )
                     self.process.stdin.write((json.dumps(value) + "\n").encode())
                     await self.process.stdin.drain()
@@ -56,13 +63,20 @@ class SpeechWorker:
 
 
 def main():
-    from aloy.speech import MLXTranscriber, PocketSynthesizer, QwenSynthesizer
+    from aloy.speech import (
+        ChatterboxSynthesizer,
+        MLXTranscriber,
+        PocketSynthesizer,
+        QwenSynthesizer,
+    )
 
     engine = sys.argv[1]
     if engine.startswith("asr:"):
         model = MLXTranscriber(engine.split(":", 1)[1])
     elif engine.startswith("qwen-tts:"):
         model = QwenSynthesizer(engine.split(":", 1)[1])
+    elif engine == "chatterbox-tts":
+        model = ChatterboxSynthesizer()
     elif engine == "tts":
         model = PocketSynthesizer()
     else:

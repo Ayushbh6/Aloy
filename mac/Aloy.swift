@@ -203,8 +203,8 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
         providerPicker.action = #selector(settingsChanged)
         canvas.addSubview(providerPicker)
         speechPicker = NSPopUpButton(frame: NSRect(x: 148, y: 24, width: 105, height: 28))
-        speechPicker.addItems(withTitles: ["Qwen Ryan", "Qwen Aiden", "Achird · API", "Text only"])
-        speechPicker.toolTip = "Achird uses paid Gemini speech; local voices do not. Aloy's $30 monthly cap still applies."
+        speechPicker.addItems(withTitles: ["Chatterbox · Local", "Achird · API", "Text only"])
+        speechPicker.toolTip = "Chatterbox runs locally. Achird uses paid Gemini speech under Aloy's $30 monthly cap."
         speechPicker.target = self
         speechPicker.action = #selector(settingsChanged)
         canvas.addSubview(speechPicker)
@@ -301,7 +301,7 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
                 providerPicker.selectItem(at: index)
             }
             if let speech = settings["speech"],
-               let index = ["qwen", "qwen-aiden", "gemini", "none"].firstIndex(of: speech) {
+               let index = ["chatterbox", "gemini", "none"].firstIndex(of: speech) {
                 speechPicker.selectItem(at: index)
             }
             if settings["mode"] == "live" { modePicker.selectItem(at: 1) }
@@ -482,7 +482,7 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
         ["gemini", "openrouter", "gemini-quality", "codex", "fake"][providerPicker.indexOfSelectedItem]
     }
     private var speech: String? {
-        let choices = ["qwen", "qwen-aiden", "gemini", "none"]
+        let choices = ["chatterbox", "gemini", "none"]
         let selected = choices[speechPicker.indexOfSelectedItem]
         return selected == "none" ? nil : selected
     }

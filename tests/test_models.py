@@ -15,11 +15,14 @@ def test_prune_only_unselected_aloy_cache(tmp_path, monkeypatch):
     discarded = hub / "models--mlx-community--whisper-large-v3-turbo" / "snapshots" / "pin"
     discarded.mkdir(parents=True)
     (discarded / "weights.safetensors").symlink_to(unused)
+    discarded_blob = discarded.parent.parent / "blobs" / "unused-weights"
+    discarded_blob.parent.mkdir()
+    discarded_blob.write_bytes(b"weights")
     outside = tmp_path / "outside"
     outside.write_bytes(b"untouched")
     monkeypatch.setattr(models, "cache_dir", lambda: hub)
 
-    assert models.prune_unselected() == len(b"unselected")
+    assert models.prune_unselected() == len(b"unselected") + len(b"weights")
     assert keep.exists()
     assert not unused.exists()
     assert not discarded.exists()

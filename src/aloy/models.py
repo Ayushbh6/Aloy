@@ -12,6 +12,16 @@ MODELS = {
         "41d3337e8b7f2843a75841595fc14e4b9a7a4b96",
         ["*.json", "*.safetensors", "*.txt"],
     ),
+    "chatterbox": (
+        "mlx-community/chatterbox-multilingual-v3",
+        "03565773edd72e949572557597af8063bb49a18a",
+        ["config.json", "tokenizer.json", "Cangjie5_TC.json", "model.safetensors"],
+    ),
+    "chatterbox-tokenizer": (
+        "mlx-community/S3TokenizerV2",
+        "e0c9886f0e1c35ae85b1f27277416fb19fc72bec",
+        ["config.json", "model.safetensors"],
+    ),
     "vad": (
         "mlx-community/Silero-VAD",
         "7bc17f22d3c0451bd3a6cd71e759b009271ff49a",
@@ -40,7 +50,7 @@ MODELS = {
 }
 
 
-DEFAULT_MODELS = ("vad", "qwen-asr", "qwen-tts")
+DEFAULT_MODELS = ("vad", "qwen-asr", "chatterbox", "chatterbox-tokenizer")
 
 
 def cache_dir() -> Path:
@@ -67,9 +77,15 @@ def prune_unselected() -> int:
     hub = cache_dir().resolve()
     if not hub.exists():
         return 0
+    reclaimed = 0
     selected = {"models--" + MODELS[name][0].replace("/", "--") for name in DEFAULT_MODELS}
     for directory in hub.glob("models--*"):
         if directory.name not in selected and directory.is_dir():
+            reclaimed += sum(
+                file.stat().st_size
+                for file in directory.rglob("*")
+                if file.is_file() and not file.is_symlink()
+            )
             shutil.rmtree(directory)
     locks = hub / ".locks"
     if locks.exists():
@@ -78,14 +94,13 @@ def prune_unselected() -> int:
                 shutil.rmtree(directory)
     blobs = hub / "blobs"
     if not blobs.exists():
-        return 0
+        return reclaimed
     required = {
         file.resolve()
         for directory in hub.glob("models--*")
         for file in directory.rglob("*")
         if file.is_symlink() and file.resolve().is_relative_to(blobs)
     }
-    reclaimed = 0
     for file in blobs.rglob("*"):
         if file.is_file() and file.name != ".huggingface-shared-blobs" and file not in required:
             reclaimed += file.stat().st_size

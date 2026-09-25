@@ -186,7 +186,8 @@ def test_dispatch_cap():
     assert guard.count == 1
 
 
-def test_standard_audio_links_and_speech_error_cleanup(tmp_path, monkeypatch):
+@pytest.mark.parametrize("engine", ["pocket", "chatterbox"])
+def test_standard_audio_links_and_speech_error_cleanup(tmp_path, monkeypatch, engine):
     import io
     import wave
 
@@ -209,7 +210,7 @@ def test_standard_audio_links_and_speech_error_cleanup(tmp_path, monkeypatch):
         bridge = Bridge()
         bridge.emit = lambda *args, **kwargs: None
         cid = bridge.store.create_conversation(PROMPT)
-        await bridge.run_turn(cid, "Q", "fake", "pocket", bridge.epoch)
+        await bridge.run_turn(cid, "Q", "fake", engine, bridge.epoch)
         assets = bridge.store.audio_assets(cid)
         assert assets and all(a["run_id"] and a["message_id"] for a in assets)
         assert bridge.store.monthly_spend() == 0
