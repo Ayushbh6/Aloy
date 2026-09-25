@@ -57,7 +57,7 @@ async def run(args):
                 started = time.monotonic()
                 audio = await synth.synthesize(text)
                 path = output / f"chatterbox-{language}.wav"
-                path.write_bytes(audio)
+                path.write_bytes(audio.data)
                 evidence["tts"].append({"file": path.name, "seconds": time.monotonic() - started})
         finally:
             await synth.close()

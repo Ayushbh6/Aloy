@@ -7,10 +7,12 @@ import re
 import subprocess
 import threading
 import wave
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
 from aloy.models import MODELS, cache_dir, model_path
+from aloy.speech_catalog import BY_ID
 from aloy.speech_worker import SpeechWorker
 from aloy.storage import data_root
 
@@ -22,7 +24,67 @@ class Transcriber(Protocol):
 
 
 class Synthesizer(Protocol):
-    async def synthesize(self, text: str) -> bytes: ...
+    async def synthesize(self, text: str) -> "SpeechAudio": ...
+
+
+@dataclass(frozen=True)
+class SpeechAudio:
+    data: bytes
+    extension: str
+    duration_seconds: float
+
+
+def wav_audio(data: bytes) -> SpeechAudio:
+    if not data.startswith(b"RIFF") or len(data) > 20_000_000:
+        raise RuntimeError("Speech engine returned unexpected WAV audio")
+    with wave.open(io.BytesIO(data), "rb") as reader:
+        if reader.getframerate() <= 0 or reader.getnframes() <= 0:
+            raise RuntimeError("Speech engine returned empty WAV audio")
+        duration = reader.getnframes() / reader.getframerate()
+    return SpeechAudio(data, "wav", duration)
+
+
+def pcm_audio(data: bytes, sample_rate: int = 24000) -> SpeechAudio:
+    if not data or len(data) % 2 or len(data) > 20_000_000:
+        raise RuntimeError("Speech engine returned unexpected PCM audio")
+    output = io.BytesIO()
+    with wave.open(output, "wb") as writer:
+        writer.setnchannels(1)
+        writer.setsampwidth(2)
+        writer.setframerate(sample_rate)
+        writer.writeframes(data)
+    return wav_audio(output.getvalue())
+
+
+def mp3_audio(data: bytes) -> SpeechAudio:
+    if len(data) < 100 or len(data) > 8_000_000:
+        raise RuntimeError("Speech engine returned unexpected MP3 audio")
+    result = subprocess.run(
+        [
+            "ffmpeg",
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            "pipe:0",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-f",
+            "s16le",
+            "pipe:1",
+        ],
+        input=data,
+        capture_output=True,
+        check=True,
+        timeout=30,
+    )
+    duration = len(result.stdout) / 32000
+    if duration <= 0 or duration > 600:
+        raise RuntimeError("Speech engine returned invalid MP3 duration")
+    return SpeechAudio(data, "mp3", duration)
 
 
 def pcm_to_wav(samples, sample_rate: int) -> bytes:
@@ -259,8 +321,8 @@ class ChatterboxSynthesizer:
             raise RuntimeError("Chatterbox returned no audio")
         return pcm_to_wav(chunks[0].audio, chunks[0].sample_rate)
 
-    async def synthesize(self, text: str) -> bytes:
-        return base64.b64decode(await self.worker.request(text))
+    async def synthesize(self, text: str) -> SpeechAudio:
+        return wav_audio(base64.b64decode(await self.worker.request(text)))
 
     async def prewarm(self) -> None:
         await self.worker.request({"command": "prewarm"})
@@ -272,6 +334,13 @@ class ChatterboxSynthesizer:
 
 
 def make_synthesizer(name: str) -> Synthesizer:
-    if name == "chatterbox":
+    option = BY_ID.get(name)
+    if option is None:
+        raise ValueError(f"Unknown TTS engine: {name}")
+    if option.provider == "local":
         return ChatterboxSynthesizer()
-    raise ValueError(f"Unknown TTS engine: {name}")
+    from aloy.paid_speech import GeminiSynthesizer, OpenRouterSynthesizer
+
+    return (
+        GeminiSynthesizer(option) if option.provider == "gemini" else OpenRouterSynthesizer(option)
+    )

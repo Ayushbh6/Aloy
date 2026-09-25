@@ -191,6 +191,7 @@ def test_standard_audio_links_and_speech_error_cleanup(tmp_path, monkeypatch):
     import wave
 
     from aloy.bridge import PROMPT
+    from aloy.speech import wav_audio
 
     buffer = io.BytesIO()
     with wave.open(buffer, "wb") as wav:
@@ -201,7 +202,7 @@ def test_standard_audio_links_and_speech_error_cleanup(tmp_path, monkeypatch):
 
     class Speech:
         async def synthesize(self, text):
-            return buffer.getvalue()
+            return wav_audio(buffer.getvalue())
 
     async def scenario():
         monkeypatch.setenv("ALOY_DATA_DIR", str(tmp_path))
@@ -223,6 +224,7 @@ def test_recording_prewarm_reuses_the_reply_synthesizer(tmp_path, monkeypatch):
     import wave
 
     from aloy.bridge import PROMPT
+    from aloy.speech import wav_audio
 
     output = io.BytesIO()
     with wave.open(output, "wb") as wav:
@@ -241,7 +243,7 @@ def test_recording_prewarm_reuses_the_reply_synthesizer(tmp_path, monkeypatch):
 
         async def synthesize(self, text):
             self.replies += 1
-            return output.getvalue()
+            return wav_audio(output.getvalue())
 
     async def scenario():
         monkeypatch.setenv("ALOY_DATA_DIR", str(tmp_path))

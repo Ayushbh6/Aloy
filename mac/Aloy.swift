@@ -202,18 +202,18 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
         canvas.addSubview(button("Delete", frame: NSRect(x: 264, y: 73, width: 108, height: 29),
                                  action: #selector(deleteConversation)))
 
-        providerPicker = NSPopUpButton(frame: NSRect(x: 20, y: 24, width: 122, height: 28))
+        providerPicker = NSPopUpButton(frame: NSRect(x: 20, y: 24, width: 115, height: 28))
         providerPicker.addItems(withTitles: ["Gemini Lite", "OpenRouter", "Gemini Flash", "Codex", "Fake"])
         providerPicker.target = self
         providerPicker.action = #selector(settingsChanged)
         canvas.addSubview(providerPicker)
-        speechPicker = NSPopUpButton(frame: NSRect(x: 148, y: 24, width: 105, height: 28))
-        speechPicker.addItems(withTitles: ["Chatterbox · Local", "Text only"])
-        speechPicker.toolTip = "Chatterbox is Aloy's only speech voice and runs locally."
+        speechPicker = NSPopUpButton(frame: NSRect(x: 141, y: 24, width: 125, height: 28))
+        speechPicker.addItem(withTitle: "Loading voices…")
+        speechPicker.isEnabled = false
         speechPicker.target = self
         speechPicker.action = #selector(settingsChanged)
         canvas.addSubview(speechPicker)
-        modePicker = NSPopUpButton(frame: NSRect(x: 259, y: 24, width: 113, height: 28))
+        modePicker = NSPopUpButton(frame: NSRect(x: 272, y: 24, width: 100, height: 28))
         modePicker.addItems(withTitles: ["Standard", "Live audio"])
         modePicker.target = self
         modePicker.action = #selector(settingsChanged)
@@ -302,13 +302,21 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
         case "ready":
             dataRoot = object["root"] as? String
             let settings = object["settings"] as? [String: String] ?? [:]
+            speechPicker.removeAllItems()
+            for option in object["speech_options"] as? [[String: String]] ?? [] {
+                guard let id = option["id"], let title = option["title"] else { continue }
+                speechPicker.addItem(withTitle: title)
+                speechPicker.lastItem?.representedObject = id
+                speechPicker.lastItem?.toolTip = option["detail"]
+            }
+            speechPicker.isEnabled = speechPicker.numberOfItems > 0
             if let provider = settings["provider"],
                let index = ["gemini", "openrouter", "gemini-quality", "codex", "fake"].firstIndex(of: provider) {
                 providerPicker.selectItem(at: index)
             }
             if let speech = settings["speech"],
-               let index = ["chatterbox", "none"].firstIndex(of: speech) {
-                speechPicker.selectItem(at: index)
+               let item = speechPicker.itemArray.first(where: { $0.representedObject as? String == speech }) {
+                speechPicker.select(item)
             }
             if settings["mode"] == "live" { modePicker.selectItem(at: 1) }
             status.stringValue = "Ready"
@@ -493,8 +501,7 @@ final class AppController: NSObject, NSApplicationDelegate, AVAudioRecorderDeleg
         ["gemini", "openrouter", "gemini-quality", "codex", "fake"][providerPicker.indexOfSelectedItem]
     }
     private var speech: String? {
-        let choices = ["chatterbox", "none"]
-        let selected = choices[speechPicker.indexOfSelectedItem]
+        let selected = speechPicker.selectedItem?.representedObject as? String ?? "chatterbox"
         return selected == "none" ? nil : selected
     }
 

@@ -8,7 +8,7 @@ version = "0.0.1"
 description = "A modular personal desktop companion and visual voice tutor."
 readme = "README.md"
 requires-python = ">=3.13,<3.14"
-dependencies = ["google-genai==2.25.0", "openai==3.19.2"]
+dependencies = ["google-genai==2.25.0", "openai==3.19.2", "httpx==0.28.1"]
 
 [project.optional-dependencies]
 speech = ["mlx-audio==0.5.6"]

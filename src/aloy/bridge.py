@@ -6,7 +6,6 @@ import json
 import re
 import sys
 import uuid
-import wave
 from contextlib import aclosing
 from contextvars import ContextVar
 from pathlib import Path
@@ -19,6 +18,7 @@ from aloy.lifecycle import RunLifecycle
 from aloy.live import MAX_SECONDS, GeminiLive, _pcm_from_wav
 from aloy.providers import MODEL_PRESETS, load_local_env, make_provider
 from aloy.speech import MLXTranscriber, make_synthesizer, to_16k_wav
+from aloy.speech_catalog import BY_ID, selectable_options, speech_cost, speech_reservation
 from aloy.vad import StreamingVoiceDetector
 
 OPERATION = ContextVar("operation", default=None)
@@ -34,7 +34,7 @@ class Bridge:
     def __init__(self) -> None:
         load_local_env()
         self.store = ConversationStore()
-        if self.store.settings().get("speech") not in (None, "chatterbox", "none"):
+        if self.store.settings().get("speech") not in (None, "none", *BY_ID):
             self.store.set_setting("speech", "chatterbox")
         self.transcriber = MLXTranscriber()
         self.voice_monitor = StreamingVoiceDetector()
@@ -94,20 +94,32 @@ class Bridge:
                 if synthesizer is None:
                     synthesizer = make_synthesizer(engine)
                     self.synthesizers[engine] = synthesizer
-                data = await synthesizer.synthesize(sentence)
-                with wave.open(__import__("io").BytesIO(data), "rb") as reader:
-                    duration = reader.getnframes() / reader.getframerate()
+                option = BY_ID[engine]
+                reservation_id = None
+                if option.provider != "local":
+                    await synthesizer.preflight()
+                    reservation_id = self.store.reserve(speech_reservation(option, sentence))
+                try:
+                    if reservation_id:
+                        self.store.mark_dispatched(reservation_id)
+                    audio = await synthesizer.synthesize(sentence)
+                    estimate = speech_cost(option, sentence, audio.duration_seconds)
+                    if reservation_id:
+                        self.store.settle(reservation_id, estimate)
+                finally:
+                    if reservation_id:
+                        self.store.settle(reservation_id)
                 if epoch != self.epoch:
                     return False
                 run_id = run_ref["id"]
                 asset = self.store.save_audio(
                     conversation_id,
-                    data,
+                    audio.data,
                     direction="output",
-                    extension="wav",
-                    duration_seconds=duration,
+                    extension=audio.extension,
+                    duration_seconds=audio.duration_seconds,
                     provider=engine,
-                    estimated_usd=0.0,
+                    estimated_usd=estimate,
                     run_id=run_id,
                     message_id=self.store.message_id(run_id, "assistant"),
                     accounted=True,
@@ -409,7 +421,7 @@ class Bridge:
                 self.voice_monitor.stop(request["session_id"])
             elif action == "prewarm_speech":
                 engine = request.get("speech")
-                if engine not in (None, "chatterbox"):
+                if engine is not None and engine not in BY_ID:
                     raise ValueError("Unknown speech engine")
                 if self.warm_task is None or self.warm_task.done():
                     self.warm_task = asyncio.create_task(self.warm_speech(engine))
@@ -452,7 +464,7 @@ class Bridge:
                 key, value = request["key"], request["value"]
                 allowed = {
                     "provider": set(MODEL_PRESETS),
-                    "speech": {"chatterbox", "none"},
+                    "speech": set(BY_ID) | {"none"},
                     "mode": {"standard", "live"},
                 }
                 if key not in allowed or value not in allowed[key]:
@@ -476,7 +488,7 @@ class Bridge:
                 if provider_name not in MODEL_PRESETS:
                     raise ValueError("Unknown provider")
                 speech_engine = request.get("speech", "chatterbox")
-                if speech_engine not in (None, "chatterbox"):
+                if speech_engine is not None and speech_engine not in BY_ID:
                     raise ValueError("Unknown speech engine")
                 conversation_id = request["conversation_id"]
                 if action == "send":
@@ -529,6 +541,7 @@ async def main() -> None:
         "ready",
         root=str(bridge.store.root),
         providers=MODEL_PRESETS,
+        speech_options=selectable_options(),
         settings=bridge.store.settings(),
     )
     try:

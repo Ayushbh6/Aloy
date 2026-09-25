@@ -350,7 +350,7 @@ class ConversationStore:
         accounted: bool = False,
     ) -> dict:
         self.conversation(conversation_id)
-        if direction not in ("input", "output") or extension not in ("wav", "m4a"):
+        if direction not in ("input", "output") or extension not in ("wav", "m4a", "mp3"):
             raise ValueError("Unsupported audio metadata")
         asset_id = str(uuid.uuid4())
         folder = self.root / "audio" / conversation_id

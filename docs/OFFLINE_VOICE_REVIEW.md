@@ -99,7 +99,8 @@ The existing Gemini Interactions TTS adapter generated two comparable 10-second
 samples using `gemini-3.8-flash-lite-tts`. Full synthesis took 7.18 and 7.97 seconds.
 The owner liked both and preferred the warm male Achird voice for that paid
 comparison. It was later removed from Standard mode when Chatterbox became the
-owner's sole selected voice. Google documents `stream=True` for incremental
+owner's sole installed offline voice, then restored as an explicit paid choice.
+Google documents `stream=True` for incremental
 raw PCM audio; the current Aloy adapter still waits for a complete WAV per sentence,
 so its measured synthesis time is not a first-audio latency claim. Streaming playback
 would need a compatible native audio queue and cancellation/accounting tests.
@@ -147,12 +148,21 @@ model components (one TTS voice, its tokenizer, ASR and VAD).
 ## Single-voice and latency follow-up
 
 The owner confirmed Chatterbox as the best offline voice audition and requested
-that other TTS engines be removed. Standard mode now accepts only Chatterbox or
-text-only output. Pocket, Qwen TTS and Gemini TTS adapters and model registry
+that other offline TTS engines be removed. Pocket and Qwen TTS adapters and model registry
 entries were removed. Pocket TTS, PyTorch and their unused dependencies were
 uninstalled from Aloy's own runtime, reducing that environment from about 1.6
 GiB to 647 MiB. ASR, Silero VAD, Chatterbox and its tokenizer remain; user audio
 and conversations were not pruned. Gemini Live remains a separate explicit mode.
+
+The Standard-mode picker now also exposes paid speech explicitly: direct Gemini
+3.8 Flash-Lite/Flash TTS, the same models through OpenRouter, and OpenRouter Grok
+Voice TTS. Achird is the selected Gemini voice; Grok's Leo voice has not been
+reviewed for German teaching. A short synthetic, one-dispatch live check passed
+for each route on 25 September 2026. These checks confirm audio generation and
+persistence, not user acceptance of voice quality or sustained latency. Paid
+routes reserve against Aloy's $30 monthly estimate before dispatch and never
+replace local Chatterbox automatically. OpenRouter Gemini returns PCM, which
+Aloy wraps as WAV; Grok returns MP3 and stays compressed in storage.
 
 Chatterbox and ASR prewarm while the microphone is open. In one adapter check,
 Chatterbox loading and reference conditioning took 2.53 seconds; a following
