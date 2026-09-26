@@ -18,6 +18,7 @@ class AgentConfig:
     max_output_tokens: int = 2048
     timeout_seconds: float = 45.0
     tools: tuple[str, ...] = ()
+    max_cost_usd: float = 0.50
     max_steps: int = 8
     context_target_tokens: int = CONTEXT_TARGET_TOKENS
     output_schema: dict[str, Any] | None = None
@@ -30,6 +31,8 @@ class AgentConfig:
             raise ValueError("Provider and model are required")
         if not 1 <= self.max_output_tokens <= 4096 or self.timeout_seconds <= 0:
             raise ValueError("Invalid output or timeout limit")
+        if not 0 < self.max_cost_usd <= 30:
+            raise ValueError("Invalid per-run spending limit")
         if not 1 <= self.max_steps <= 32 or self.context_target_tokens < 1000:
             raise ValueError("Invalid step or context limit")
         if self.policy not in {"read_only", "no_capture", "approval_required"}:
@@ -59,7 +62,9 @@ class ToolSpec:
     name: str
     description: str
     input_schema: dict[str, Any]
-    permission: Literal["read", "memory_write", "capture", "artifact_write", "action"] = "read"
+    permission: Literal["read", "memory_write", "capture", "artifact_write", "action", "host"] = (
+        "read"
+    )
     max_output_chars: int = 8000
 
 
@@ -76,6 +81,7 @@ class ToolResult:
     name: str
     value: dict[str, Any]
     success: bool = True
+    media: tuple[dict[str, Any], ...] = ()
 
 
 ActionRequest = Callable[[ToolCall, str, str], Awaitable[dict[str, Any]]]
@@ -131,6 +137,7 @@ class ProviderEvent:
 @dataclass(frozen=True)
 class AgentEvent:
     kind: Literal[
+        "timing",
         "started",
         "context",
         "memory",

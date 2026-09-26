@@ -16,7 +16,10 @@ jobs:
       - run: python -m pip check
       - run: python -m ruff check .
       - run: python -m ruff format --check .
+      - run: sudo apt-get update && sudo apt-get install -y poppler-utils ffmpeg ripgrep
       - run: python -m pytest -q
+      - run: python -m aloy.harness_smoke --mode fake --scenario pdf
+      - run: python -m aloy.harness_smoke --mode fake --scenario video
       - run: python -c "import aloy"
   native:
     runs-on: macos-15
@@ -25,7 +28,7 @@ jobs:
       - name: Native interaction and model checks
         shell: bash
         run: |
-          sources=(mac/InteractionState.swift mac/OrbView.swift mac/Playground.swift mac/Canvas.swift mac/CompanionBubble.swift mac/ComputerActionApproval.swift mac/ScreenCapture.swift)
+          sources=(mac/VoiceAudio.swift mac/InteractionState.swift mac/OrbView.swift mac/Playground.swift mac/Canvas.swift mac/CompanionBubble.swift mac/ComputerActionApproval.swift mac/ScreenCapture.swift)
           frameworks=(-framework AppKit -framework ApplicationServices -framework CoreGraphics -framework AVFoundation -framework ScreenCaptureKit -framework SwiftUI)
           swiftc -swift-version 5 "${sources[@]}" mac/tests/main.swift "${frameworks[@]}" -o "$RUNNER_TEMP/aloy-check"
           "$RUNNER_TEMP/aloy-check"

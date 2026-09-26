@@ -71,7 +71,7 @@ def test_context_current_input_once_and_failed_history_excluded(tmp_path):
     asyncio.run(scenario())
 
 
-def test_required_compaction_failure_prevents_main_dispatch(tmp_path):
+def test_compaction_failure_preserves_evidence_and_uses_recoverable_fallback(tmp_path):
     async def scenario():
         store = ConversationStore(tmp_path)
         config = AgentConfig(provider="fake", model="fake-v1", context_target_tokens=2000)
@@ -81,7 +81,7 @@ def test_required_compaction_failure_prevents_main_dispatch(tmp_path):
             store.finish_run(run, "completed", f"Answer {number} " * 15)
 
         class Broken(FakeMaintenance):
-            async def compact(self, *args):
+            async def checkpoint(self, *args):
                 raise RuntimeError("Synthetic maintenance unavailable")
 
         provider = FakeProvider()
@@ -91,10 +91,12 @@ def test_required_compaction_failure_prevents_main_dispatch(tmp_path):
                 AgentInput(cid, "Continue")
             )
         ]
-        assert events[-1].kind == "failed"
-        assert "maintenance unavailable" in events[-1].error
-        assert provider.calls == []
-        assert len(store.messages(cid)) == 61
+        assert any(e.kind == "completed" for e in events)
+        assert len(provider.calls) == 1
+        assert len(store.messages(cid)) == 62
+        assert (
+            store.db.execute("SELECT status FROM harness_checkpoints").fetchone()[0] == "fallback"
+        )
         store.close()
 
     asyncio.run(scenario())

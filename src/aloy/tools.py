@@ -20,6 +20,8 @@ from aloy.canvas import (
 )
 from aloy.contracts import ActionRequest, AgentConfig, ToolCall, ToolResult, ToolSpec, Usage
 from aloy.errors import safe_error
+from aloy.harness_state import evidence
+from aloy.harness_tools import HARNESS_NAMES, HARNESS_SPECS, HarnessTools
 from aloy.media import MEDIA_SCHEMA, parse_observations, prepared_media
 from aloy.memory_index import MemoryIndex
 from aloy.privacy import PRIVATE_PATTERN
@@ -365,6 +367,10 @@ def _validate(spec: ToolSpec, arguments: dict) -> None:
     validate(arguments, spec.input_schema)
     if not isinstance(arguments, dict):
         raise ValueError("Tool arguments must be an object")
+    if spec.permission == "host":
+        if len(json.dumps(arguments)) > 1_000_000:
+            raise ValueError("Tool arguments exceed 1 MB")
+        return
     schema = spec.input_schema
     if set(arguments) - set(schema["properties"]):
         raise ValueError("Unknown tool argument")
@@ -383,6 +389,9 @@ def _validate(spec: ToolSpec, arguments: dict) -> None:
             raise ValueError(f"Invalid {key}")
 
 
+TOOL_SPECS = (*TOOL_SPECS, *HARNESS_SPECS)
+
+
 @dataclass(frozen=True)
 class ToolContext:
     store: ConversationStore
@@ -399,11 +408,14 @@ class ToolContext:
     action_policy: str = "read_only"
     request_action: ActionRequest | None = None
     captures: set[str] = field(default_factory=set, compare=False)
+    media_types: tuple[str, ...] = ()
+    media_out: list[dict] = field(default_factory=list, compare=False)
 
 
 class ToolRegistry:
     def __init__(self, specs: tuple[ToolSpec, ...] = TOOL_SPECS) -> None:
         self.by_name = {spec.name: spec for spec in specs}
+        self.harness = HarnessTools()
 
     def specs(self, names: tuple[str, ...]) -> tuple[ToolSpec, ...]:
         if any(name not in self.by_name for name in names):
@@ -416,6 +428,14 @@ class ToolRegistry:
             return ToolResult(call.id, call.name, {"error": "unknown_tool"}, False)
         try:
             _validate(spec, call.arguments)
+            media_start = len(context.media_out)
+            if spec.permission == "host" and (
+                context.input_origin != "user"
+                or context.store.settings().get("host_access") != "full"
+            ):
+                return ToolResult(
+                    call.id, call.name, {"error": "host_access_disabled_for_this_input"}, False
+                )
             if spec.permission == "action":
                 if context.input_origin != "user":
                     return ToolResult(call.id, call.name, {"error": "untrusted_interaction"}, False)
@@ -440,11 +460,21 @@ class ToolRegistry:
             value = await self._execute(call, context)
             if spec.permission == "action" and value.get("status") != "completed":
                 return ToolResult(call.id, call.name, value, False)
+            # Save full tool evidence before bounding the model-facing projection.
+            ref = evidence(context.store, context.conversation_id, context.run_id, call.name, value)
+            if spec.permission == "host" or call.name == "media.inspect":
+                value = {**value, "evidence_ref": "e:" + ref}
             # Bound results before they enter any provider's next context.
             serialized = json.dumps(value, ensure_ascii=False)
             if len(serialized) > spec.max_output_chars:
-                value = {"truncated": True, "text": serialized[: spec.max_output_chars]}
-            return ToolResult(call.id, call.name, value)
+                value = {
+                    "truncated": True,
+                    "text": serialized[: spec.max_output_chars],
+                    "evidence_ref": "e:" + ref,
+                }
+            return ToolResult(
+                call.id, call.name, value, media=tuple(context.media_out[media_start:])
+            )
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -457,6 +487,8 @@ class ToolRegistry:
 
     async def _execute(self, call: ToolCall, c: ToolContext) -> dict:
         args = call.arguments
+        if call.name in HARNESS_NAMES:
+            return await self.harness.execute(call.name, c, args)
         if call.name == "memory.search":
             mode = args.get("mode", "hybrid")
             rows = []

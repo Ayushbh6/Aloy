@@ -2,9 +2,11 @@
 
 import asyncio
 import base64
+import hashlib
 import json
 import re
 import sys
+import time
 import uuid
 from contextlib import aclosing
 from contextvars import ContextVar
@@ -22,7 +24,14 @@ from aloy.live import MAX_SECONDS, GeminiLive, _pcm_from_wav
 from aloy.maintenance import FakeMaintenance, MaintenanceService
 from aloy.memory_index import MemoryIndex
 from aloy.providers import MODEL_PRESETS, load_local_env, make_provider
-from aloy.speech import MLXTranscriber, make_synthesizer, to_16k_wav
+from aloy.speech import (
+    MLXTranscriber,
+    SpeechAudio,
+    make_synthesizer,
+    mp3_audio,
+    to_16k_wav,
+    wav_audio,
+)
 from aloy.speech_catalog import (
     BY_ID,
     resolve_voice,
@@ -32,6 +41,7 @@ from aloy.speech_catalog import (
 )
 from aloy.tools import TOOL_SPECS, VISION_MODELS, ToolRegistry
 from aloy.vad import StreamingVoiceDetector
+from aloy.voice_session import VoiceSegmenter, pcm_wav
 
 OPERATION = ContextVar("operation", default=None)
 VERSION = 2
@@ -87,15 +97,154 @@ class Bridge:
         self.warm_task: asyncio.Task | None = None
         self.active: asyncio.Task | None = None
         self.epoch = 0
+        self.voice_session = None
 
     def emit(self, event: str, **data) -> None:
         print(
             json.dumps(
-                {"v": VERSION, "event": event, "operation_id": OPERATION.get(), **data},
+                {
+                    "v": VERSION,
+                    "event": event,
+                    "operation_id": OPERATION.get(),
+                    "voice_epoch": self.epoch,
+                    **data,
+                },
                 ensure_ascii=False,
             ),
             flush=True,
         )
+
+    def timing(self, stage: str, run_id=None, *, value=None, source="backend", stamp=None):
+        with self.store.transaction():
+            self.store.db.execute(
+                "INSERT INTO voice_timings(operation_id,run_id,stage,source,monotonic_seconds,"
+                "value,created_at) VALUES(?,?,?,?,?,?,?)",
+                (
+                    OPERATION.get(),
+                    run_id,
+                    stage,
+                    source,
+                    time.monotonic() if stamp is None else stamp,
+                    value,
+                    datetime.now(UTC).isoformat(),
+                ),
+            )
+
+    def close_voice_capture(self):
+        session, self.voice_session = self.voice_session, None
+        if session:
+            pcm = session["segmenter"].close()
+            if pcm:
+                self.store.save_audio(
+                    session["conversation_id"],
+                    pcm_wav(pcm),
+                    direction="input",
+                    extension="wav",
+                    duration_seconds=len(pcm) / 32000,
+                )
+
+    async def voice_open(self, request):
+        self.close_voice_capture()
+        await self.stop(announce=False)
+        cid = request["conversation_id"]
+        self.store.conversation(cid)
+        engine = request.get("speech", "gemini-lite")
+        voice = resolve_voice(engine, request.get("voice"))
+        provider = request.get("provider", "gemini")
+        if provider not in MODEL_PRESETS:
+            raise ValueError("Unknown provider")
+        segmenter = VoiceSegmenter(request["session_id"])
+        await asyncio.to_thread(segmenter.start)
+        self.voice_session = {
+            "segmenter": segmenter,
+            "conversation_id": cid,
+            "provider": provider,
+            "speech": engine,
+            "voice": voice,
+        }
+        self.timing("session_ready")
+        self.emit("voice_ready", session_id=segmenter.session_id)
+        if self.warm_task is None or self.warm_task.done():
+            self.warm_task = asyncio.create_task(self.warm_speech(engine, voice))
+        now = datetime.now()
+        hour = now.hour
+        greeting = (
+            "Good morning" if hour < 12 else "Good afternoon" if hour < 18 else "Good evening"
+        )
+        self.active = asyncio.create_task(
+            self.voice_cue(
+                cid,
+                engine,
+                voice,
+                f"{greeting}, Ayush. Welcome back. How's your {now:%A} going?",
+            )
+        )
+
+    async def voice_cue(self, cid, engine, voice, text):
+        queue = asyncio.Queue()
+        await queue.put(text)
+        await queue.put(None)
+        self.emit("voice_cue", text=text)
+        ok = await self.speak(queue, cid, engine, voice, self.epoch, {"id": None, "cue": True})
+        self.emit("turn_done", conversation_id=cid, failed=not ok)
+
+    async def voice_frames(self, request):
+        session = self.voice_session
+        if not session or request.get("session_id") != session["segmenter"].session_id:
+            return
+        payload = request.get("pcm", "")
+        if len(payload) > 44000:
+            raise ValueError("Microphone frame too large")
+        events = await asyncio.to_thread(
+            session["segmenter"].feed, base64.b64decode(payload, validate=True)
+        )
+        for event in events:
+            if event.kind == "speech":
+                # Tell native playback to stop BEFORE waiting for provider/worker cleanup.
+                self.emit("voice_activity", state="speech", voice_epoch=self.epoch + 1)
+                self.timing("speech_detected")
+                await self.stop(announce=False)
+            else:
+                self.timing("endpoint", value=event.samples / 16000)
+                self.emit("voice_activity", state="processing")
+                asset = self.store.save_audio(
+                    session["conversation_id"],
+                    pcm_wav(event.pcm),
+                    direction="input",
+                    extension="wav",
+                    duration_seconds=len(event.pcm) / 32000,
+                )
+                self.timing("input_saved")
+                self.active = asyncio.create_task(self.voice_transcribe(session, asset, self.epoch))
+
+    async def voice_transcribe(self, session, asset, epoch):
+        try:
+            self.timing("asr_start")
+            text = await self.transcriber.transcribe(Path(asset["path"]))
+            self.timing("asr_end")
+            if epoch != self.epoch:
+                return
+            if not text:
+                self.record_input_outcome(session["conversation_id"], asset["id"], "cancelled")
+                self.emit("no_speech", message="No speech detected")
+                return
+            self.emit("transcript", text=text)
+            await self.run_turn(
+                session["conversation_id"],
+                text,
+                session["provider"],
+                session["speech"],
+                epoch,
+                asset["id"],
+                session["voice"],
+                capture_authorized=clear_capture_request(text),
+            )
+        except asyncio.CancelledError:
+            self.record_input_outcome(session["conversation_id"], asset["id"], "cancelled")
+            raise
+        except Exception as exc:
+            self.record_input_outcome(session["conversation_id"], asset["id"], "failed")
+            self.emit("error", error=safe_error(exc))
 
     async def stop(self, announce: bool = True) -> None:
         self.epoch += 1
@@ -125,6 +274,7 @@ class Bridge:
                 pass
         self.active = None
         if announce:
+            await self.registry.harness.terminal.close()
             self.emit("stopped")
 
     async def capture(self, kind: str, seconds: int, conversation_id: str) -> dict:
@@ -341,23 +491,75 @@ class Bridge:
                 sentence = await queue.get()
                 if sentence is None:
                     return True
+                run_id = run_ref.get("id")
+                self.timing("tts_queued", run_id)
                 key = (engine, voice)
                 synthesizer = self.synthesizers.get(key)
                 if synthesizer is None:
                     synthesizer = make_synthesizer(engine, voice)
                     self.synthesizers[key] = synthesizer
                 option = BY_ID[engine]
+                cache = None
+                if run_ref.get("cue"):
+                    digest = hashlib.sha256(f"v1:{engine}:{voice}:{sentence}".encode()).hexdigest()
+                    extension = ".mp3" if engine == "router-grok" else ".wav"
+                    cache = self.store.root / "speech-cues" / (digest + extension)
+                cached = cache is not None and cache.is_file()
                 reservation_id = None
-                if option.provider != "local":
+                if not cached and option.provider != "local":
+                    self.timing("tts_preflight_start", run_id)
                     await synthesizer.preflight()
+                    self.timing("tts_preflight_end", run_id)
                     reservation_id = self.store.reserve(
                         speech_reservation(option, sentence), provider=option.provider
                     )
+                streamed = False
+                stream_id = str(uuid.uuid4())
                 try:
                     if reservation_id:
                         self.store.mark_dispatched(reservation_id)
-                    audio = await synthesizer.synthesize(sentence)
-                    estimate = speech_cost(option, sentence, audio.duration_seconds)
+                    self.timing("tts_dispatch", run_id)
+                    if cached:
+                        audio = (
+                            mp3_audio(cache.read_bytes())
+                            if cache.suffix == ".mp3"
+                            else wav_audio(cache.read_bytes())
+                        )
+                    elif hasattr(synthesizer, "stream"):
+                        streamed = True
+                        chunks = bytearray()
+                        self.emit(
+                            "audio_stream_start",
+                            stream_id=stream_id,
+                            sample_rate=24000,
+                            run_id=run_id,
+                        )
+                        async with aclosing(synthesizer.stream(sentence)) as stream:
+                            async for chunk in stream:
+                                if epoch != self.epoch:
+                                    return False
+                                if not chunks:
+                                    self.timing("tts_first_audio", run_id)
+                                chunks.extend(chunk)
+                                # Bound each bridge packet; a provider can deliver a large chunk.
+                                for offset in range(0, len(chunk), 9600):
+                                    self.emit(
+                                        "audio_chunk",
+                                        stream_id=stream_id,
+                                        pcm=base64.b64encode(
+                                            chunk[offset : offset + 9600]
+                                        ).decode(),
+                                    )
+                        audio = SpeechAudio(
+                            pcm_wav(bytes(chunks), 24000), "wav", len(chunks) / 48000
+                        )
+                    else:
+                        audio = await synthesizer.synthesize(sentence)
+                        self.timing("tts_first_audio", run_id)
+                    self.timing("tts_complete", run_id)
+                    estimate = (
+                        0 if cached else speech_cost(option, sentence, audio.duration_seconds)
+                    )
                     if reservation_id:
                         self.store.settle(reservation_id, estimate)
                 finally:
@@ -365,7 +567,12 @@ class Bridge:
                         self.store.settle(reservation_id)
                 if epoch != self.epoch:
                     return False
-                run_id = run_ref["id"]
+                if cache and not cached:
+                    cache.parent.mkdir(mode=0o700, exist_ok=True)
+                    temporary = cache.with_suffix(".tmp")
+                    temporary.write_bytes(audio.data)
+                    temporary.chmod(0o600)
+                    temporary.replace(cache)
                 asset = self.store.save_audio(
                     conversation_id,
                     audio.data,
@@ -375,16 +582,22 @@ class Bridge:
                     provider=engine,
                     estimated_usd=estimate,
                     run_id=run_id,
-                    message_id=self.store.message_id(run_id, "assistant"),
+                    message_id=self.store.message_id(run_id, "assistant") if run_id else None,
                     accounted=True,
                 )
+                self.timing("audio_saved", run_id)
                 self.emit(
                     "audio",
                     path=asset["path"],
                     asset_id=asset["id"],
                     text=sentence,
                     conversation_id=conversation_id,
+                    run_id=run_id,
+                    streamed=streamed,
+                    stream_id=stream_id,
                 )
+                if streamed:
+                    self.emit("audio_stream_end", stream_id=stream_id, asset_id=asset["id"])
                 queue.task_done()
         except asyncio.CancelledError:
             raise
@@ -438,6 +651,8 @@ class Bridge:
         )
         buffer = ""
         failed = False
+        speech_queued = False
+        first_token = True
         try:
             settings = self.store.settings()
             if tools is None and "tools" in settings:
@@ -448,8 +663,8 @@ class Bridge:
                 provider=provider_name,
                 model=MODEL_PRESETS[provider_name],
                 tools=tools if tools is not None else DEFAULT_TOOLS,
-                max_steps=8,
-                timeout_seconds=180,
+                max_steps=32,
+                timeout_seconds=600,
                 policy=settings.get("agent_policy", "read_only"),
             )
             provider = make_provider(provider_name, self.store)
@@ -482,7 +697,12 @@ class Bridge:
                 async for event in events:
                     if epoch != self.epoch:
                         return
-                    if event.kind == "delta":
+                    if event.kind == "timing":
+                        self.timing(event.data["stage"], event.run_id, stamp=event.data["stamp"])
+                    elif event.kind == "delta":
+                        if first_token:
+                            self.timing("model_first_token", event.run_id)
+                            first_token = False
                         self.active_text += event.text
                         self.emit("delta", text=event.text, run_id=event.run_id)
                         buffer += event.text
@@ -490,6 +710,7 @@ class Bridge:
                         # utterance. Independent sentence requests outrun playback
                         # and lose prosody; replay hid that by having every clip ready.
                     elif event.kind == "started":
+                        self.timing("run_start", event.run_id)
                         self.active_text = ""
                         run_ref["id"] = event.run_id
                         if input_asset:
@@ -501,6 +722,11 @@ class Bridge:
                             user_text=text,
                         )
                     elif event.kind == "completed":
+                        self.timing("model_complete", event.run_id)
+                        if speech_task and not speech_queued:
+                            await queue.put(event.text.strip())
+                            await queue.put(None)
+                            speech_queued = True
                         self.emit(
                             "completed",
                             run_id=event.run_id,
@@ -536,9 +762,10 @@ class Bridge:
                             data=event.data,
                         )
             if speech_task and not failed:
-                if buffer.strip():
-                    await queue.put(buffer.strip())
-                await queue.put(None)
+                if not speech_queued:
+                    if buffer.strip():
+                        await queue.put(buffer.strip())
+                    await queue.put(None)
                 speech_ok = await speech_task
                 failed = failed or not speech_ok
             if run_ref:
@@ -741,8 +968,46 @@ class Bridge:
             return
         try:
             if action in {"new", "select", "delete"}:
+                self.close_voice_capture()
                 await self.stop(announce=False)
-            if action == "capture_result":
+            if action == "voice_open":
+                await self.voice_open(request)
+            elif action == "voice_frames":
+                await self.voice_frames(request)
+            elif action == "voice_close":
+                session = self.voice_session
+                self.close_voice_capture()
+                await self.stop(announce=False)
+                if session and request.get("goodbye", True):
+                    self.active = asyncio.create_task(
+                        self.voice_cue(
+                            session["conversation_id"],
+                            session["speech"],
+                            session["voice"],
+                            "Goodbye, Ayush. I'll be here when you need me.",
+                        )
+                    )
+                else:
+                    self.emit("stopped")
+            elif action == "voice_timing":
+                stage = request["stage"]
+                if stage not in {
+                    "mic_open",
+                    "mic_closed",
+                    "playback_render_started",
+                    "playback_drained",
+                    "playback_underrun",
+                    "interrupt_stop_ms",
+                    "audio_received",
+                    "voice_processing_enabled",
+                }:
+                    raise ValueError("Unknown native timing")
+                stamp = float(request["stamp"])
+                value = request.get("value")
+                if not 0 <= stamp < 1e12 or (value is not None and not 0 <= float(value) < 1e9):
+                    raise ValueError("Invalid native timing")
+                self.timing(stage, request.get("run_id"), source="native", stamp=stamp, value=value)
+            elif action == "capture_result":
                 waiter = self.capture_waiters.get(request.get("capture_id"))
                 if waiter and not waiter.done():
                     if request.get("error"):
@@ -1077,6 +1342,7 @@ class Bridge:
                         "mode": {"standard", "live"},
                         "vision_route": set(VISION_MODELS),
                         "agent_policy": {"read_only", "approval_required"},
+                        "host_access": {"full", "disabled"},
                     }
                     if key not in allowed or value not in allowed[key]:
                         raise ValueError("Unsupported setting")
@@ -1092,6 +1358,7 @@ class Bridge:
                 self.store.set_setting(key, value)
                 self.emit("settings_saved", id=request_id)
             elif action == "stop":
+                self.close_voice_capture()
                 await self.stop()
             elif action in ("send", "recorded"):
                 await self.stop(announce=False)
@@ -1198,6 +1465,8 @@ async def main() -> None:
             except (ValueError, TypeError) as exc:
                 bridge.emit("error", error=f"Invalid request: {exc}")
     finally:
+        await bridge.registry.harness.close()
+        bridge.close_voice_capture()
         await bridge.stop()
         if bridge.index_task and not bridge.index_task.done():
             bridge.index_task.cancel()

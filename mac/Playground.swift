@@ -87,15 +87,19 @@ final class PlaygroundModel: ObservableObject {
     @Published var speechOptions: [[String: Any]] = []
     @Published var mode = "standard"
     @Published var agentPolicy = "read_only"
+    @Published var hostAccess = "full"
     @Published var enabledTools = Set([
         "web.search", "memory.search", "memory.remember", "memory.forget",
-        "screen.snapshot", "screen.record_clip", "media.inspect", "canvas.present"
+        "screen.snapshot", "screen.record_clip", "media.inspect", "canvas.present",
+        "read", "glob", "grep", "edit", "apply_patch", "terminal", "terminal_control",
+        "context_retrieve", "capability_search", "capability_control"
     ])
     @Published var status = "Ready"
     @Published var lastError: String?
     @Published var companionStatus: CompanionPresence = .ready
     @Published var activeRun: String?
     @Published var isSending = false
+    @Published var voiceSessionActive = false
     @Published var memoryMode = "hybrid"
     @Published var inspector = "Activity"
     @Published var storageBytes: Int64?
@@ -146,6 +150,7 @@ final class PlaygroundModel: ObservableObject {
             speechEngine = settings["speech"] ?? speechEngine
             mode = settings["mode"] ?? mode
             agentPolicy = settings["agent_policy"] ?? agentPolicy
+            hostAccess = settings["host_access"] ?? hostAccess
             speechOptions = object["speech_options"] as? [[String: Any]] ?? speechOptions
             voicesByEngine = Dictionary(uniqueKeysWithValues: settings.compactMap { entry in
                 let (key, value) = entry
@@ -355,6 +360,16 @@ final class PlaygroundModel: ObservableObject {
             activeRun = nil
             status = "Stopped"
             companionStatus = .ready
+        case "voice_activity":
+            if object["state"] as? String == "speech" {
+                if let activeRun { invalidateRun(activeRun) }
+                activeRun = nil
+                isSending = false
+                companionStatus = .listening
+            }
+        case "no_speech":
+            activeRun = nil
+            isSending = false
         case "speech_activity":
             companionStatus = (object["state"] as? String == "speech") ? .listening : .recording
         default: break
@@ -576,6 +591,11 @@ struct AgentPlayground: View {
         ("Gemini Flash", "gemini-quality"), ("Codex", "codex"), ("Offline fake", "fake")
     ]
     private let toolLabels: [(String, String)] = [
+        ("read", "Read files and visual media"), ("glob", "Find files"), ("grep", "Search file contents"),
+        ("edit", "Write and edit files"), ("apply_patch", "Patch files"),
+        ("terminal", "Run terminal commands"), ("terminal_control", "Control terminal sessions"),
+        ("context_retrieve", "Retrieve original context"),
+        ("capability_search", "Discover skills and tools"), ("capability_control", "Use skills and tools"),
         ("web.search", "Web search"), ("memory.search", "Search memory"),
         ("memory.remember", "Save a memory"), ("memory.forget", "Forget a memory"),
         ("screen.snapshot", "Capture a screenshot"), ("screen.record_clip", "Record a short screen clip"),
@@ -606,6 +626,7 @@ struct AgentPlayground: View {
         .onChange(of: model.mode) { _, value in model.persistSetting("mode", value) }
         .onChange(of: model.speechVoice) { _, value in model.persistSetting("voice:\(model.speechEngine)", value) }
         .onChange(of: model.enabledTools) { _, _ in model.saveTools() }
+        .onChange(of: model.hostAccess) { _, value in model.persistSetting("host_access", value) }
         .onChange(of: model.agentPolicy) { _, value in model.persistSetting("agent_policy", value) }
         .onChange(of: model.conversationQuery) { _, _ in model.searchConversations() }
         .sheet(item: $renameTarget) { conversation in
@@ -859,17 +880,17 @@ struct AgentPlayground: View {
                 Button(action: model.attach) { Image(systemName: "paperclip") }
                     .help("Attach an image, audio, or video")
                 Button { model.onRecord?() } label: {
-                    Label(model.companionStatus == .recording || model.companionStatus == .listening
-                        ? "Finish & Send" : "Record", systemImage: "mic")
+                    Label(model.mode == "live" ? (model.companionStatus == .recording ? "Finish & Send" : "Record")
+                        : (model.voiceSessionActive ? "Close voice" : "Talk to Aloy"), systemImage: "mic")
                 }
-                .help("Record a voice message")
+                .help("Option–Z opens or closes a voice conversation")
                 Button {
                     if let onStop = model.onStop { onStop() }
                     else { model.command("stop", [:]) }
                 } label: {
                     Image(systemName: "stop.fill")
                 }
-                .disabled(!model.isSending && model.companionStatus != .recording && model.companionStatus != .listening)
+                .disabled(!model.voiceSessionActive && !model.isSending && model.companionStatus != .speaking && model.companionStatus != .recording && model.companionStatus != .listening)
                 .help("Stop the current turn or cancel recording")
                 Spacer()
                 Text("\(model.speechEngine == "chatterbox" ? "Local voice" : "\(model.speechEngine) voice")")
@@ -993,6 +1014,10 @@ struct AgentPlayground: View {
                     }
                     settingsSection("Tools", detail: "Enabled tools are available to new runs.") {
                         VStack(alignment: .leading, spacing: 10) {
+                            Picker("Files and terminal", selection: $model.hostAccess) {
+                                Text("Full Mac access").tag("full")
+                                Text("Disabled").tag("disabled")
+                            }.frame(width: 230)
                             Picker("Desktop policy", selection: $model.agentPolicy) {
                                 Text("Read only").tag("read_only")
                                 Text("Require approval").tag("approval_required")

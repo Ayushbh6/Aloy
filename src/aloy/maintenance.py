@@ -188,6 +188,9 @@ class MaintenanceService:
             )
         return saved
 
+    async def checkpoint(self, run_id, prompt, schema):
+        return await self._generate(run_id, prompt, schema, 2048)
+
     async def compact(
         self,
         run_id: str | None,
@@ -218,6 +221,15 @@ class MaintenanceService:
 
 
 class FakeMaintenance(MaintenanceService):
+    async def checkpoint(self, run_id, prompt, schema):
+        return {
+            "summary": prompt[-4000:],
+            "constraints": [],
+            "decisions": [],
+            "outstanding_requests": [],
+            "next_steps": [],
+        }
+
     async def extract(
         self, run_id: str, conversation_id: str, user_text: str, source_message_id: str | None
     ) -> list[dict]:

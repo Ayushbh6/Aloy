@@ -66,17 +66,17 @@ final class OrbView: NSView {
 
     private var motionState: OrbMotionState {
         if hasError { return .attention }
-        if isRecording { return .listening }
         if isSpeaking { return .speaking }
         if isProcessing { return .thinking }
+        if isRecording { return .listening }
         return .quiet
     }
 
     private var stateLabel: String {
         if hasError { return "Needs you" }
-        if isRecording { return "Listening" }
         if isSpeaking { return "Speaking" }
         if isProcessing { return "Thinking" }
+        if isRecording { return "Listening" }
         return "Quiet"
     }
 

@@ -70,6 +70,13 @@ assert(darkMarks > 20 && brightMarks > 100)
 assert(particleRaster.colorAt(x: 0, y: 0)!.alphaComponent == 0)
 print("Orb dual-tone contrast and transparent-background checks passed")
 orb.isRecording = true
+orb.isSpeaking = true
+assert(orb.accessibilityLabel() == "Aloy — Speaking")
+orb.isSpeaking = false
+orb.isProcessing = true
+assert(orb.accessibilityLabel() == "Aloy — Thinking")
+orb.isProcessing = false
+assert(orb.accessibilityLabel() == "Aloy — Listening")
 assert(root.animation(forKey: "orbit") == nil && cloud.contents != nil)
 print("Orb fixed-footprint and transparent particle-layer checks passed")
 

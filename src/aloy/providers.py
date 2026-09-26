@@ -17,6 +17,7 @@ from aloy.contracts import (
     Usage,
 )
 from aloy.dispatch import DispatchBudget, gemini_client
+from aloy.multimodal import gemini_blocks, router_blocks, wire_name
 from aloy.storage import ConversationStore, data_root
 
 MODEL_PRESETS = {
@@ -44,6 +45,8 @@ def load_local_env(path: Path | None = None) -> None:
 
 
 class OpenRouterProvider:
+    native_media_types = ()
+
     def __init__(
         self, api_key: str | None = None, *, dispatch: DispatchBudget | None = None, client=None
     ) -> None:
@@ -65,16 +68,28 @@ class OpenRouterProvider:
 
     async def preflight(self, model: str):
         catalog = await self.client.models.list()
-        if model not in {item.id for item in catalog.data}:
+        item = next((item for item in catalog.data if item.id == model), None)
+        architecture = (getattr(item, "model_extra", None) or {}).get("architecture", {})
+        self.native_media_types = tuple(
+            m for m in architecture.get("input_modalities", []) if m in {"image", "video"}
+        )
+        if item is None:
             raise ValueError(f"OpenRouter model unavailable: {model}")
 
     async def step(self, turn: ProviderTurn) -> ProviderStepResult:
         if not hasattr(self, "_tool_history") or not turn.prior_results:
             self._tool_history = [{"role": "system", "content": turn.system_prompt}]
             self._tool_history.extend(
-                {"role": item.role, "content": item.text}
+                {
+                    "role": "user" if item.role == "tool" else item.role,
+                    "content": (
+                        "Historical tool evidence " + item.name + ": "
+                        if item.role == "tool"
+                        else ""
+                    )
+                    + item.text,
+                }
                 for item in turn.messages
-                if item.role != "tool"
             )
         else:
             for result in turn.prior_results:
@@ -84,6 +99,30 @@ class OpenRouterProvider:
                         "tool_call_id": result.call_id,
                         "content": json.dumps(result.value, ensure_ascii=False),
                     }
+                )
+        media = [a for result in turn.prior_results for a in result.media] or list(turn.media)
+        if media:
+            self._tool_history.append(
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "Media returned by the preceding read tool; inspect it as evidence."
+                            ),
+                        },
+                        *router_blocks(media),
+                    ],
+                }
+            )
+        # Older tool outputs retain their evidence handles, not unlimited inline text.
+        tool_entries = [m for m in self._tool_history if m.get("role") == "tool"]
+        for entry in tool_entries[:-4]:
+            if len(entry["content"]) > 800:
+                value = json.loads(entry["content"])
+                entry["content"] = json.dumps(
+                    {"evidence_ref": value.get("evidence_ref"), "excerpt": entry["content"][:400]}
                 )
         wire_tools = [
             {
@@ -152,7 +191,7 @@ class OpenRouterProvider:
             arguments = json.loads(entry["arguments"])
             if not isinstance(arguments, dict):
                 raise ValueError("OpenRouter tool arguments must be an object")
-            parsed.append(ToolCall(entry["id"], entry["name"].replace("_", ".", 1), arguments))
+            parsed.append(ToolCall(entry["id"], wire_name(entry["name"], turn.tools), arguments))
         if parsed:
             self._tool_history.append(
                 {
@@ -234,6 +273,8 @@ class OpenRouterProvider:
 
 
 class GeminiProvider:
+    native_media_types = ("image", "video")
+
     def __init__(
         self,
         store: ConversationStore,
@@ -278,13 +319,40 @@ class GeminiProvider:
         else:
             request_input = [
                 {
-                    "type": "user_input" if item.role == "user" else "model_output",
-                    "content": [{"type": "text", "text": item.text}],
+                    "type": "model_output" if item.role == "assistant" else "user_input",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "Historical tool evidence " + item.name + ": "
+                                if item.role == "tool"
+                                else ""
+                            )
+                            + item.text,
+                        }
+                    ],
                 }
                 for item in turn.messages
-                if item.role != "tool"
             ]
             previous_id = None
+        media = [a for result in turn.prior_results for a in result.media] or list(turn.media)
+        if media:
+            if isinstance(request_input, str):
+                request_input = [
+                    {"type": "user_input", "content": [{"type": "text", "text": request_input}]}
+                ]
+            request_input.append(
+                {
+                    "type": "user_input",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Media returned by read; inspect the actual content.",
+                        },
+                        *gemini_blocks(media),
+                    ],
+                }
+            )
         wire_tools = [
             {
                 "type": "function",
@@ -364,7 +432,7 @@ class GeminiProvider:
             arguments = json.loads(entry["arguments"] or "{}")
             if not isinstance(arguments, dict):
                 raise ValueError("Gemini tool arguments must be an object")
-            parsed.append(ToolCall(entry["id"], entry["name"].replace("_", ".", 1), arguments))
+            parsed.append(ToolCall(entry["id"], wire_name(entry["name"], turn.tools), arguments))
         if for_type == "requires_action" and not parsed:
             raise RuntimeError("Gemini requires an unrecognized action")
         return ProviderStepResult(
@@ -396,7 +464,7 @@ class GeminiProvider:
         else:
             request_input = [
                 {
-                    "type": "user_input" if item.role == "user" else "model_output",
+                    "type": "model_output" if item.role == "assistant" else "user_input",
                     "content": [{"type": "text", "text": item.text}],
                 }
                 for item in messages

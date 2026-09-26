@@ -89,6 +89,14 @@ class ConversationStore:
                         "UPDATE audio_assets SET playback_status='missing' WHERE id=?",
                         (asset["id"],),
                     )
+        with self.transaction():
+            self.db.execute(
+                "UPDATE terminal_sessions SET status='interrupted' WHERE status='running'"
+            )
+            self.db.execute(
+                "UPDATE harness_checkpoints SET status='interrupted' WHERE status='building'"
+            )
+            self.db.execute("UPDATE task_states SET status='interrupted' WHERE status='active'")
         self.drain_deletions()
         # Unreferenced audio/tmp files are retained, never silently deleted.
 
@@ -99,6 +107,15 @@ class ConversationStore:
             "gemini-lite": "gemini",
             "router-grok": "openrouter",
         }.get(provider, provider)
+        from aloy.budget import RUN_BUDGET
+
+        admission = RUN_BUDGET.get()
+        if (
+            admission
+            and admission[0] == self.root
+            and self.monthly_spend() - admission[1] + amount > admission[2]
+        ):
+            raise RuntimeError("Per-run spending limit reached; progress remains saved")
         if amount < 0:
             raise ValueError("Negative reservation")
         reservation_id = str(uuid.uuid4())
@@ -808,7 +825,10 @@ class ConversationStore:
         formats = {
             ("image", "image/png"): "png",
             ("image", "image/jpeg"): "jpg",
+            ("image", "image/webp"): "webp",
+            ("image", "image/gif"): "gif",
             ("video", "video/mp4"): "mp4",
+            ("video", "video/webm"): "webm",
             ("video", "video/quicktime"): "mov",
             ("audio", "audio/wav"): "wav",
             ("audio", "audio/mpeg"): "mp3",

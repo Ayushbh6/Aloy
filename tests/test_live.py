@@ -128,6 +128,7 @@ def test_bridge_settings_persist_and_reject_unknown_values(tmp_path, monkeypatch
         await bridge.handle({"v": 1, "action": "set_setting", "key": "mode", "value": "unknown"})
         assert events[-1][0] == "error"
         assert bridge.store.settings() == {
+            "host_access": "full",
             "provider": "fake",
             "speech": "router-grok",
             "voice:router-grok": "ara",

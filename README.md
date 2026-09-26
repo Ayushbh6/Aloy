@@ -20,9 +20,18 @@ open mac/build/Aloy.app
 
 Create `~/Library/Application Support/Aloy/credentials.env` with `GEMINI_API_KEY` and/or `OPENROUTER_API_KEY`, and restrict it with `chmod 600`. An ignored project `.env` remains a fallback for terminal development. The Mac app uses the one runtime under Application Support, where it installs a small wheel of the current source during `mac/build.sh`. The project `.venv` is only a link, so this does not duplicate the speech dependencies. The default is Gemini 3.5 Flash-Lite text, local Silero speech detection, Qwen3 ASR 1.7B, and Chatterbox Multilingual V3 speech. The speech picker contains exactly three choices: Chatterbox local, direct Gemini 3.8 Flash-Lite TTS, and `x-ai/grok-voice-tts-1.0` through OpenRouter. A separate voice picker remembers a selection for each engine. Defaults are the existing warm male Chatterbox reference, Gemini Achird, and Grok Sal (the latter still needs a personal audition). Chatterbox uses the private 24 kHz mono WAV at `~/Library/Application Support/Aloy/models/chatterbox-reference.wav`; additional consented WAV references placed in `~/Library/Application Support/Aloy/models/voices/` appear after restarting Aloy, without downloading another model. Gemini offers its 30 prebuilt voices; OpenRouter Grok offers five. Text-provider choices remain separate. If a selected speech route is unavailable or over budget, Aloy reports the error rather than silently changing voices or charging another provider.
 
-The first Record click asks macOS for microphone access. Aloy shows Recording only after capture starts. Use **Finish & Send** to transcribe/send, or **Cancel recording** to keep the recording locally without sending it. Right-click Replay to hear the last input recording; a normal click replays the last reply. Development rebuilds may prompt for microphone permission again.
+In **Standard** mode, Option + Z (or **Talk to Aloy**) opens a continuous voice session.
+Aloy greets you, listens, and sends each utterance after about 0.96 seconds of detected
+silence. Speak while Aloy talks to interrupt it. Option + Z closes the microphone and
+plays a goodbye; Option + X immediately cancels everything. The first use requests
+microphone permission. Unfinished speech is retained locally when you close/cancel.
 
-While Standard recording is open, local Silero VAD shows when speech starts and when a long pause begins; a pause does not automatically send the turn. The final VAD pass trims only leading/trailing silence before Qwen ASR, keeping pauses and fillers between spoken phrases. Chatterbox warms in the background during recording. Option + Z still sends; Option + X cancels.
+The native duplex audio engine enables macOS voice processing, echo cancellation and
+automatic gain control. Local Silero VAD and Qwen ASR process microphone speech; ambient
+microphone frames are not uploaded. This is speech detection, not speaker identification:
+background video speech can still trigger a turn. Gemini TTS streams one continuous reply
+with a small playback buffer; Chatterbox and Grok retain their whole-reply output routes.
+See [voice session review](docs/VOICE_SESSION_REVIEW.md) for measured results and limits.
 
 Aloy runs when you open the app and remains available as one floating orb while its process is alive. Closing the chat panel leaves the orb running; click it to reopen the panel. This first build has no login item or automatic crash restart yet.
 
@@ -76,19 +85,22 @@ Experimental pronunciation feedback accepts a short mono 16 kHz WAV recording wi
 
 ## Current boundary
 
-Live audio is a bounded, click-to-record native audio exchange after recording stops; microphone frames in Standard mode are monitored locally for speech activity but are not streamed to the Live provider. The current local Chatterbox path has not met the three-second stop-to-first-audio target. Screen perception is now implemented, but native recording still needs a manual permission/cancellation check on this build. German curriculum, learner mastery, generative lesson visuals, computer actions, wake words and proactive reminders remain future work. See [engineering rules](docs/ENGINEERING.md), [implementation plan](docs/INITIAL_PLAN.md), and the current [repair review](docs/REPAIR_REVIEW.md).
+The full-access agent harness is implemented: read images/videos on compatible
+models, search/edit files anywhere on the Mac, run a real terminal, recover original
+context after compression, and save durable goals/tasks and German learning evidence.
+Settings → Files and terminal controls access. See [harness review](docs/HARNESS_REVIEW.md)
+for the tool set, PDF workflow, recovery behaviour, optional skills/MCP and verification.
+
+Live audio is a bounded, click-to-record native audio exchange after recording stops; Standard mode uses local continuous speech detection and ASR; it does not stream microphone frames to the Live provider. The current local Chatterbox path has not met the three-second stop-to-first-audio target. Screen perception is now implemented, but native recording still needs a manual permission/cancellation check on this build. German curriculum, learner mastery, generative lesson visuals, computer actions, wake words and proactive reminders remain future work. See [engineering rules](docs/ENGINEERING.md), [implementation plan](docs/INITIAL_PLAN.md), and the current [repair review](docs/REPAIR_REVIEW.md).
 
 ## Global voice shortcut
 
-With Aloy running, press and release **Option + Z** to record from any app.
-Press and release it again to send; the selected speech engine reads the reply.
-The panel stays closed. The orb is red while capturing. Using the shortcut during
-playback interrupts that reply and starts a new recording. Hold/repeat generates
-only one action on release. Record / Finish & Send use the same native functions.
-A shortcut conflict produces an alert rather than silently failing. This shortcut
-requires Aloy to be running; it does not wake a sleeping Mac or launch a quit app.
+With Aloy running in Standard mode, press and release **Option + Z** to open or close
+voice from any app. The panel stays closed. Hold/repeat produces only one action on
+release. In explicit Gemini Live mode, Option + Z retains manual record/send behavior
+and its five-minute recording limit. A shortcut conflict produces an alert.
+Aloy must be running; the shortcut does not wake a sleeping Mac or launch a quit app.
 Microphone permission is required; no accessibility key-monitoring permission is used.
-The existing five-minute recording limit still applies.
 
 Voice wake research is in [VOICE_ACTIVATION.md](docs/VOICE_ACTIVATION.md).
 
@@ -98,8 +110,8 @@ Silero gate before ASR; silence yields “No speech detected” and no agent dis
 The compact particle orb is red when recording, mint when speaking, and amber on
 errors, with faster internal motion while processing.
 
-See [offline voice review](docs/OFFLINE_VOICE_REVIEW.md) for the latest model comparison
-and acceptance evidence.
+See [voice session review](docs/VOICE_SESSION_REVIEW.md) for current session evidence
+and [offline voice review](docs/OFFLINE_VOICE_REVIEW.md) for historical model comparisons.
 # Development restarts
 
 After local changes, run `zsh mac/restart.sh` to gracefully quit this checkout's

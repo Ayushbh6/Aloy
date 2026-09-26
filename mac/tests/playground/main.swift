@@ -237,6 +237,12 @@ struct PlaygroundModelChecks {
         model.receive(["event": "conversation", "conversation_id": "different", "messages": []])
         assert(model.attachments.isEmpty && model.messages.isEmpty)
         assert(model.currentArtifact == nil && !model.canvasPresented)
+        model.receive(["event": "started", "run_id": "interrupted-voice", "user_text": "Synthetic"])
+        assert(model.isSending && model.activeRun != nil)
+        model.receive(["event": "voice_activity", "state": "speech"])
+        assert(!model.isSending && model.activeRun == nil && model.companionStatus == .listening)
+        model.receive(["event": "no_speech"])
+        assert(!model.isSending && model.activeRun == nil)
         print("Playground model, strict artifact validation, cancellation, and interaction checks passed")
     }
 }

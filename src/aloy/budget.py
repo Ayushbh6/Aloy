@@ -1,8 +1,11 @@
 """Conservative direct text cost estimates; the owner ceiling lives here."""
 
+from contextvars import ContextVar
 from datetime import UTC, datetime
 
 from aloy.contracts import AgentConfig, Message, Usage
+
+RUN_BUDGET = ContextVar("aloy_run_budget", default=None)
 
 MONTHLY_LIMIT_USD = 30.0
 MONTHLY_WARNING_USD = 20.0

@@ -16,6 +16,7 @@ from aloy.contracts import (
     ToolCall,
     Usage,
 )
+from aloy.multimodal import data_url, wire_name
 from aloy.storage import ConversationStore, data_root
 
 DISABLED_FEATURES = (
@@ -32,10 +33,13 @@ DISABLED_FEATURES = (
     "memories",
     "goals",
     "image_generation",
+    "view_image",
 )
 
 
 class CodexProvider:
+    native_media_types = ("image",)
+
     """One provider-managed turn; no claim about hidden underlying model calls."""
 
     uses_dynamic_tools = True
@@ -311,7 +315,7 @@ class CodexProvider:
                         params = packet.get("params", {})
                         tool_call = ToolCall(
                             params.get("callId", ""),
-                            params.get("tool", "").replace("_", ".", 1),
+                            wire_name(params.get("tool", ""), agent_turn.tools),
                             params.get("arguments", {}),
                         )
                         result = await self._tool_callback(tool_call)
@@ -320,10 +324,17 @@ class CodexProvider:
                             "result": {
                                 "success": result.success,
                                 "contentItems": [
+                                    *[
+                                        {
+                                            "type": "inputImage",
+                                            "imageUrl": data_url(asset),
+                                        }
+                                        for asset in result.media
+                                    ],
                                     {
                                         "type": "inputText",
                                         "text": json.dumps(result.value, ensure_ascii=False),
-                                    }
+                                    },
                                 ],
                             },
                         }

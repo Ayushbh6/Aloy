@@ -53,6 +53,11 @@ final class AppController: NSObject, NSApplicationDelegate, @preconcurrency AVAu
     private var lastAudioPath: String?
     private var currentRunID: String?
     private var replyAudio = ReplyAudioState()
+    private let voiceAudio = VoiceAudio()
+    private var voiceSessionID: String?
+    private var voiceEpoch = 0
+    private var audioRunID: String?
+
 
     private struct CapturedTargetRecord {
         let operationID: String
@@ -61,7 +66,7 @@ final class AppController: NSObject, NSApplicationDelegate, @preconcurrency AVAu
 
     private func updateReplyAppearance() {
         orb.isSpeaking = replyAudio.isSpeaking(
-            hasPlayback: player?.isPlaying == true || !audioQueue.isEmpty)
+            hasPlayback: player?.isPlaying == true || !audioQueue.isEmpty || voiceAudio.hasPlayback)
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -87,6 +92,27 @@ final class AppController: NSObject, NSApplicationDelegate, @preconcurrency AVAu
                 "operation_id": proposal.operationID, "run_id": proposal.runID,
                 "decision": decision], version: 2, operationID: proposal.operationID)
         }
+        voiceAudio.onPCM = { [weak self] data in
+            guard let self, let session = self.voiceSessionID else { return }
+            self.command("voice_frames", ["session_id": session, "pcm": data.base64EncodedString()])
+        }
+        voiceAudio.onError = { [weak self] message in
+            self?.stopAction()
+            self?.showNativeError(message)
+        }
+        voiceAudio.onMetric = { [weak self] stage, value in self?.voiceMetric(stage, value: value) }
+        voiceAudio.onPlaybackFinished = { [weak self] in
+            guard let self else { return }
+            if let id = self.playingAssetID {
+                self.command("playback", ["asset_id": id, "status": "played"])
+            }
+            self.playingAssetID = nil
+            if !self.audioQueue.isEmpty { self.playNext() }
+            else {
+                self.replyAudio.finishGeneration()
+                self.restoreListeningAppearance()
+            }
+        }
         buildOrb()
         buildBubble()
         screenCapture = ScreenCaptureCoordinator()
@@ -110,6 +136,7 @@ final class AppController: NSObject, NSApplicationDelegate, @preconcurrency AVAu
     func applicationWillTerminate(_ notification: Notification) {
         for hotKey in hotKeys { UnregisterEventHotKey(hotKey) }
         if let hotKeyHandler { RemoveEventHandler(hotKeyHandler) }
+        voiceAudio.shutdown()
         recorder?.stop()
         voiceMonitor?.inputNode.removeTap(onBus: 0)
         voiceMonitor?.stop()
@@ -152,10 +179,10 @@ final class AppController: NSObject, NSApplicationDelegate, @preconcurrency AVAu
         if failed {
             let alert = NSAlert()
             alert.messageText = "An Aloy shortcut is unavailable"
-            alert.informativeText = "Option–Z records/sends; Option–X cancels. Another app may own a shortcut. Open Aloy to use the conversation controls."
+            alert.informativeText = "Option–Z opens/closes voice; Option–X stops immediately. Another app may own a shortcut. Open Aloy to use the conversation controls."
             alert.runModal()
         }
-        orb.toolTip = "Option–Z: record/send · Option–X: cancel · Click for chat"
+        orb.toolTip = "Option–Z: open/close voice · Option–X: stop · Click for chat"
     }
 
     private func label(_ title: String, frame: NSRect, size: CGFloat = 12,
@@ -323,6 +350,10 @@ final class AppController: NSObject, NSApplicationDelegate, @preconcurrency AVAu
     private func handle(_ object: [String: Any]) {
         guard let event = object["event"] as? String else { return }
         if let id = object["operation_id"] as? String, !operation.accepts(id) { return }
+        if let epoch = object["voice_epoch"] as? Int {
+            guard epoch >= voiceEpoch else { return }
+            voiceEpoch = epoch
+        }
         playgroundModel.receive(object)
         if let request = actionPayload(object, kind: "action_requested") {
             handleActionRequest(request)
@@ -408,6 +439,43 @@ final class AppController: NSObject, NSApplicationDelegate, @preconcurrency AVAu
             lastAudioAssetID = (object["audio"] as? [[String: Any]])?.last(where: {
                 $0["direction"] as? String == "output"
             })?["id"] as? String
+        case "voice_ready":
+            status.stringValue = "Listening — Option–Z closes voice"
+            playgroundModel.companionStatus = .listening
+        case "voice_cue":
+            replyAudio.begin()
+            status.stringValue = object["text"] as? String ?? "Welcome back"
+            playgroundModel.status = status.stringValue
+        case "voice_activity":
+            guard voiceSessionID != nil else { return }
+            if object["state"] as? String == "speech" {
+                let began = ProcessInfo.processInfo.systemUptime
+                stopPlayback()
+                voiceMetric("interrupt_stop_ms", value: (ProcessInfo.processInfo.systemUptime - began) * 1000)
+                status.stringValue = "Hearing you…"
+                playgroundModel.companionStatus = .listening
+            } else {
+                orb.isProcessing = true
+                status.stringValue = "Thinking…"
+                playgroundModel.companionStatus = .thinking
+            }
+        case "audio_stream_start":
+            guard let id = object["stream_id"] as? String else { return }
+            audioRunID = object["run_id"] as? String
+            do { try voiceAudio.beginStream(id) }
+            catch { showNativeError("Audio output unavailable"); stopAction() }
+        case "audio_chunk":
+            guard let id = object["stream_id"] as? String,
+                  let pcm = object["pcm"] as? String, let data = Data(base64Encoded: pcm) else { return }
+            replyAudio.audioArrived()
+            voiceAudio.append(data, stream: id)
+            orb.isProcessing = false
+            updateReplyAppearance()
+            playgroundModel.companionStatus = .speaking
+        case "audio_stream_end":
+            guard let id = object["stream_id"] as? String else { return }
+            playingAssetID = object["asset_id"] as? String
+            voiceAudio.endStream(id)
         case "started":
             replyAudio.begin()
             orb.isProcessing = true
@@ -441,8 +509,11 @@ final class AppController: NSObject, NSApplicationDelegate, @preconcurrency AVAu
                 lastAudioPath = path
                 lastAudioAssetID = id
                 replayAssets.append((path, id))
-                audioQueue.append((path, id))
-                playNext()
+                if object["streamed"] as? Bool != true {
+                    audioRunID = object["run_id"] as? String
+                    audioQueue.append((path, id))
+                    playNext()
+                }
                 updateReplyAppearance()
                 playgroundModel.companionStatus = .speaking
             }
@@ -462,6 +533,7 @@ final class AppController: NSObject, NSApplicationDelegate, @preconcurrency AVAu
             }
             if let currentRunID { capturedTargetsByRun.removeValue(forKey: currentRunID) }
             currentRunID = nil
+            restoreListeningAppearance()
             command("list")
         case "recording_retained":
             status.stringValue = "Saved locally. Right-click Replay to hear it. Not sent."
@@ -477,7 +549,15 @@ final class AppController: NSObject, NSApplicationDelegate, @preconcurrency AVAu
             status.stringValue = "No speech detected — nothing sent"
             orb.toolTip = status.stringValue
             playgroundModel.companionStatus = .ready
+            restoreListeningAppearance()
         case "error", "speech_error":
+            if voiceSessionID != nil {
+                voiceAudio.stopCapture()
+                voiceSessionID = nil
+                playgroundModel.voiceSessionActive = false
+                orb.isRecording = false
+                command("voice_close", ["goodbye": false])
+            }
             orb.hasError = true
             orb.isProcessing = false
             stopPlayback()
@@ -638,10 +718,15 @@ final class AppController: NSObject, NSApplicationDelegate, @preconcurrency AVAu
     }
 
     private func playNext() {
-        guard player?.isPlaying != true, !audioQueue.isEmpty else { return }
+        guard player?.isPlaying != true, !voiceAudio.hasPlayback, !audioQueue.isEmpty else { return }
         let asset = audioQueue.removeFirst()
         playingAssetID = asset.id
         do {
+            if voiceSessionID != nil {
+                try voiceAudio.playFile(URL(fileURLWithPath: asset.path), id: asset.id)
+                command("playback", ["asset_id": asset.id, "status": "playing"])
+                return
+            }
             player = try AVAudioPlayer(contentsOf: URL(fileURLWithPath: asset.path))
             player?.delegate = self
             guard player?.play() == true else {
@@ -678,7 +763,8 @@ final class AppController: NSObject, NSApplicationDelegate, @preconcurrency AVAu
 
     private func stopPlayback() {
         let began = ProcessInfo.processInfo.systemUptime
-        let wasPlaying = player?.isPlaying == true
+        let wasPlaying = player?.isPlaying == true || voiceAudio.hasPlayback
+        voiceAudio.stopPlayback()
         player?.stop()
         player = nil
         let cancelled = audioQueue
@@ -704,7 +790,84 @@ final class AppController: NSObject, NSApplicationDelegate, @preconcurrency AVAu
         playgroundModel?.speechVoice ?? currentVoice
     }
 
+    private func voiceMetric(_ stage: String, value: Double? = nil) {
+        var fields: [String: Any] = ["stage": stage, "stamp": ProcessInfo.processInfo.systemUptime]
+        if let value { fields["value"] = value }
+        if let audioRunID { fields["run_id"] = audioRunID }
+        command("voice_timing", fields)
+    }
+
+    private func restoreListeningAppearance() {
+        updateReplyAppearance()
+        if voiceSessionID != nil && !voiceAudio.hasPlayback && player?.isPlaying != true && !orb.isProcessing {
+            status.stringValue = "Listening — Option–Z closes voice"
+            playgroundModel.companionStatus = .listening
+            orb.isRecording = true
+        } else if voiceSessionID == nil && !voiceAudio.hasPlayback && player?.isPlaying != true {
+            updateReplyAppearance()
+            if !orb.isProcessing {
+                status.stringValue = "Ready"
+                playgroundModel.companionStatus = .ready
+            }
+        }
+    }
+
     @objc private func toggleRecording() {
+        if currentMode == "live" { toggleManualRecording(); return }
+        if voiceSessionID != nil {
+            voiceAudio.stopCapture()
+            voiceSessionID = nil
+            playgroundModel.voiceSessionActive = false
+            orb.isRecording = false
+            stopPlayback()
+            invalidateOperation()
+            command("voice_close", ["goodbye": true])
+            status.stringValue = "Goodbye…"
+            return
+        }
+        guard dataRoot != nil, conversationID != nil, !microphoneRequestPending else { return }
+        switch AVCaptureDevice.authorizationStatus(for: .audio) {
+        case .authorized: startVoiceSession()
+        case .notDetermined:
+            microphoneRequestPending = true
+            AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
+                DispatchQueue.main.async {
+                    guard let self, self.microphoneRequestPending else { return }
+                    self.microphoneRequestPending = false
+                    if granted { self.startVoiceSession() }
+                    else { self.showNativeError("Microphone access was not granted") }
+                }
+            }
+        default: showNativeError("Enable Aloy microphone access in System Settings")
+        }
+    }
+
+    private func startVoiceSession() {
+        guard let cid = conversationID else { return }
+        stopAction()
+        audioRunID = nil
+        let session = UUID().uuidString
+        voiceSessionID = session
+        do {
+            try voiceAudio.startCapture()
+            playgroundModel.voiceSessionActive = true
+            orb.isRecording = true
+            orb.hasError = false
+            orb.toolTip = "Microphone open — Option–Z closes · Option–X stops"
+            status.stringValue = "Opening voice…"
+            playgroundModel.companionStatus = .listening
+            command("voice_open", ["conversation_id": cid, "session_id": session,
+                                   "provider": provider, "speech": speech, "voice": voice])
+            // A quiet, local activation cue; it never waits for network inference.
+            NSSound(named: "Pop")?.play()
+        } catch {
+            voiceSessionID = nil
+            voiceAudio.shutdown()
+            showNativeError("Voice processing could not start: \(error.localizedDescription)")
+        }
+    }
+
+    private func toggleManualRecording() {
         if recorder != nil { finishRecording(); return }
         guard dataRoot != nil, conversationID != nil, !microphoneRequestPending else { NSSound.beep(); return }
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
@@ -846,6 +1009,9 @@ final class AppController: NSObject, NSApplicationDelegate, @preconcurrency AVAu
     }
 
     @objc private func stopAction() {
+        voiceAudio.stopCapture()
+        voiceSessionID = nil
+        playgroundModel.voiceSessionActive = false
         captureTask?.cancel()
         stopVoiceMonitor()
         invalidateOperation()
@@ -873,6 +1039,7 @@ final class AppController: NSObject, NSApplicationDelegate, @preconcurrency AVAu
         actionApproval.cancelPending()
         actionApproval.clear()
         operation.invalidate()
+        voiceEpoch = 0
         capturedTargetsByRun.removeAll()
         currentRunID = nil
     }

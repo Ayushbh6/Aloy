@@ -1,4 +1,4 @@
-"""Local streaming speech activity; recording and end-of-turn remain user controlled."""
+"""Local streaming speech activity for manual capture and continuous sessions."""
 
 import math
 
@@ -16,6 +16,8 @@ class StreamingVoiceDetector:
         self.active = False
         self.hot_frames = 0
         self.quiet_frames = 0
+        self.speech_frames = 2
+        self.silence_frames = 38
 
     def start(self, session_id: str, sample_rate: int) -> None:
         if not session_id or not 8000 <= sample_rate <= 96000:
@@ -67,13 +69,13 @@ class StreamingVoiceDetector:
         if probability >= 0.55:
             self.hot_frames += 1
             self.quiet_frames = 0
-            if not self.active and self.hot_frames >= 2:
+            if not self.active and self.hot_frames >= self.speech_frames:
                 self.active = True
                 return "speech"
         elif probability < 0.30:
             self.quiet_frames += 1
             self.hot_frames = 0
-            if self.active and self.quiet_frames >= 38:
+            if self.active and self.quiet_frames >= self.silence_frames:
                 self.active = False
                 return "pause"
         else:

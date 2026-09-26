@@ -34,7 +34,7 @@ JavaScript execution in the teaching UI.
 
 `AgentSpec`/`AgentInput`, `ProviderTurn`, `ToolSpec`/`ToolCall`/`ToolResult`, and
 `AgentEvent` cover the Chunk 1 runtime. `CONTEXT_TARGET_TOKENS=30_000` is central;
-the newest eight completed exchanges remain verbatim while older history is
+up to the newest eight completed exchanges remain verbatim within budget while older history is
 summarized and retrieved. SQLite is canonical; LanceDB is a rebuildable projection.
 No arbitrary generated UI is executed. Chunk 2 renders version-one, bounded native
 artifacts through `canvas.present`: heading, text, sentence, choice, table, chart
@@ -68,6 +68,14 @@ must declare any stronger or weaker enforcement semantics; never claim the limit
 hidden remote reasoning or tool steps.
 
 ## Cross-cutting invariants
+
+The approved full host harness extends this same pipeline. Its tools, compaction
+records, exact evidence retrieval, process lifecycle and learner-evidence contracts
+are documented in [HARNESS_REVIEW.md](HARNESS_REVIEW.md). Host access is independent
+of the native screen/action policy. No project fence or container is imposed.
+File-tool writes retain backups; shell effects require their own verification on
+resume. Every paid helper shares the current run's admission budget. Raw tool output
+and terminal logs are private local evidence, not sanitized public logs.
 
 - Explicit run lifecycle, durable outcomes and structured errors.
 - Cancellation and deadlines propagate through provider, tool, speech and child work.

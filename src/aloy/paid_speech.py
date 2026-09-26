@@ -24,42 +24,73 @@ class GeminiSynthesizer:
             await self.client.aio.models.get(model=self.option.model)
             self.checked = True
 
+    def _request(self, text: str) -> dict:
+        return {
+            "model": self.option.model,
+            "input": [
+                {
+                    "type": "user_input",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": text,
+                            "annotations": [
+                                {
+                                    "type": "speech_metadata",
+                                    "style": (
+                                        "Warm, natural, conversational; speak as one flowing "
+                                        "utterance. Pronounce the name Aloy as Ah-loy "
+                                        "(two syllables, Ah then loy), not Ee-loy or Eli. "
+                                        "Do not speak these pronunciation instructions."
+                                    ),
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ],
+            "response_format": {"type": "audio"},
+            "generation_config": {
+                "speech_config": [{"voice": self.option.voice}],
+                "max_output_tokens": 4096,
+            },
+        }
+
     async def synthesize(self, text: str) -> SpeechAudio:
         async with asyncio.timeout(45):
             self.dispatch.consume()
-            interaction = await self.client.aio.interactions.create(
-                model=self.option.model,
-                input=[
-                    {
-                        "type": "user_input",
-                        "content": [
-                            {
-                                "type": "text",
-                                "text": text,
-                                "annotations": [
-                                    {
-                                        "type": "speech_metadata",
-                                        "style": (
-                                            "Warm, natural, conversational; speak as one flowing "
-                                            "utterance. Pronounce the name Aloy as Ah-loy "
-                                            "(two syllables, Ah then loy), not Ee-loy or Eli. "
-                                            "Do not speak these pronunciation instructions."
-                                        ),
-                                    }
-                                ],
-                            }
-                        ],
-                    }
-                ],
-                response_format={"type": "audio"},
-                generation_config={
-                    "speech_config": [{"voice": self.option.voice}],
-                    "max_output_tokens": 4096,
-                },
-            )
+            interaction = await self.client.aio.interactions.create(**self._request(text))
         if not interaction.output_audio or not interaction.output_audio.data:
             raise RuntimeError("Gemini TTS returned no audio")
         return wav_audio(base64.b64decode(interaction.output_audio.data))
+
+    async def stream(self, text: str):
+        """One continuous utterance, delivered as playable PCM before completion."""
+        self.dispatch.consume()
+        async with asyncio.timeout(45):
+            stream = await self.client.aio.interactions.create(**self._request(text), stream=True)
+            completed, total = False, 0
+            try:
+                async for event in stream:
+                    if event.event_type == "step.delta" and event.delta.type == "audio":
+                        mime = getattr(event.delta, "mime_type", None)
+                        if mime and not mime.startswith(("audio/l16", "audio/pcm")):
+                            raise RuntimeError("Unexpected streaming speech format")
+                        data = base64.b64decode(event.delta.data, validate=True)
+                        total += len(data)
+                        if total > 20_000_000 or len(data) % 2 or data.startswith(b"RIFF"):
+                            raise RuntimeError("Invalid streaming speech PCM")
+                        if data:
+                            yield data
+                    elif event.event_type == "interaction.completed":
+                        completed = True
+                    elif event.event_type in {"error", "interaction.failed"}:
+                        raise RuntimeError("Streaming speech provider failed")
+                if not completed or not total:
+                    raise RuntimeError("Streaming speech ended without a complete response")
+            finally:
+                if hasattr(stream, "aclose"):
+                    await stream.aclose()
 
     async def close(self) -> None:
         await self.client.aio.aclose()

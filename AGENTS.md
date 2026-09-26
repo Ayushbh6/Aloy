@@ -25,8 +25,12 @@ Do not introduce a parallel dependency workflow.
 - Every implementation change includes appropriate checks and meaningful behavior
   tests for changed runtime behavior. No duplicate code path to make a test pass.
 - The owner explicitly approved implementing the first companion and speech foundation
-  in docs/INITIAL_PLAN.md. Curriculum, generative lesson visuals, tools, screen context,
+  in docs/INITIAL_PLAN.md. Curriculum, generative lesson visuals,
   wake words and background jobs remain deferred until separately scoped.
+- The owner has now approved the full host harness end-to-end. Preserve its ten
+  core tools, real local terminal, native read, recoverable compaction and durable
+  goal/task/learning evidence. Do not reintroduce project fences or a second loop.
+  See docs/HARNESS_REVIEW.md for bounds, recovery semantics and current evidence.
 - Keep Aloy's local footprint lean. Download only selected weight files into its dedicated
   cache. After comparisons, remove losing models, stale temporary files and unneeded build
   artifacts; preserve conversations and user recordings. Never prune unrelated caches.
@@ -71,13 +75,14 @@ requires explicit authorization. No application framework implies permission to 
   environment may also contain an older installed package during development.
 - Tag asynchronous transport events with operation IDs. A stop/mode change invalidates old
   playback and events. Cancel recording retains the audio locally; Finish & Send transcribes.
-- Wake words, automatic turn detection and interruption are required for the eventual
-  product. The next interaction round may start with a toggle-to-record keyboard shortcut;
-  do not claim these features are delivered by the current manual recording controls.
+- Standard continuous sessions now use local automatic turn detection and speech
+  interruption. Preserve the shared duplex engine and whole-utterance streaming.
+  Wake words and speaker identification remain deferred. See docs/VOICE_SESSION_REVIEW.md.
 
 ## Current activation priority
 
-One-hand shortcuts only: Option + Z records/sends; Option + X cancels. Option + Space
+One-hand shortcuts only: Option + Z opens/closes Standard voice sessions; Option + X
+cancels immediately. Explicit Gemini Live retains manual record/send. Option + Space
 belongs to Codex and must not be registered by Aloy. Prioritize agent functionality
 and its supporting capabilities. Hey Aloy voice activation remains planned for a
 soon-following phase, explicitly deferred for now. Do not implement or download
